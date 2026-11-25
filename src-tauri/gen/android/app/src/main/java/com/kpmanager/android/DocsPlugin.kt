@@ -1,8 +1,15 @@
 package com.kpmanager.android
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.PersistableBundle
 import android.provider.OpenableColumns
 import android.util.Base64
 import androidx.activity.result.ActivityResult
@@ -27,17 +34,90 @@ class CreateArgs {
   lateinit var data: String
 }
 
+@InvokeArg
+class CopyArgs {
+  lateinit var text: String
+  var clearAfterMs: Long = 30_000
+}
+
+private const val CLIP_LABEL = "KP Manager"
+
 /**
  * Abrir y guardar documentos con el selector del sistema (Storage Access Framework).
  *
  * Solo lo llama la parte nativa (Rust): la interfaz web no tiene permiso para este plugin, así que el contenido
  * de un fichero de clave o de una copia de seguridad nunca pasa por el WebView. No pide permisos de
  * almacenamiento: el usuario elige cada fichero y la app solo recibe acceso a ese.
+ *
+ * También copia al portapapeles: el valor llega desde Rust (nunca desde la interfaz), se marca como sensible
+ * (Android no lo enseña en la vista previa) y se borra pasado un rato o al bloquear, salvo que el usuario haya
+ * copiado otra cosa después.
  */
 @TauriPlugin
 class DocsPlugin(private val activity: Activity) : Plugin(activity) {
   private var pendingCreate: CreateArgs? = null
   private var pendingMax: Int = 0
+
+  private val main = Handler(Looper.getMainLooper())
+  /** Cuenta las copias: el borrado programado solo actúa sobre la última. */
+  private var copies = 0
+  /** Lo que hay en el portapapeles sigue siendo lo último que copió la app. */
+  private var ours = false
+  private val clipboard get() = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+  private val onClipChanged = ClipboardManager.OnPrimaryClipChangedListener {
+    // Con la app en primer plano se puede leer la etiqueta; si es de otra app, ya no es nuestro.
+    val label = try { clipboard.primaryClipDescription?.label?.toString() } catch (e: Exception) { null }
+    if (label != null && label != CLIP_LABEL) ours = false
+  }
+
+  @Command
+  fun copyText(invoke: Invoke) {
+    val args = invoke.parseArgs(CopyArgs::class.java)
+    main.post {
+      try {
+        val clip = ClipData.newPlainText(CLIP_LABEL, args.text)
+        clip.description.extras = PersistableBundle().apply {
+          // ClipDescription.EXTRA_IS_SENSITIVE (Android 13); en versiones anteriores se ignora.
+          putBoolean("android.content.extra.IS_SENSITIVE", true)
+        }
+        val cm = clipboard
+        cm.removePrimaryClipChangedListener(onClipChanged)
+        cm.setPrimaryClip(clip)
+        ours = true
+        val mine = ++copies
+        main.post { cm.addPrimaryClipChangedListener(onClipChanged) }
+        main.postDelayed({ if (mine == copies) clearIfOurs() }, args.clearAfterMs)
+        invoke.resolve()
+      } catch (ex: Exception) {
+        invoke.reject("failed")
+      }
+    }
+  }
+
+  /** Al bloquear: borra lo copiado si sigue en el portapapeles. */
+  @Command
+  fun clearClipboard(invoke: Invoke) {
+    main.post {
+      copies++
+      clearIfOurs()
+      invoke.resolve()
+    }
+  }
+
+  private fun clearIfOurs() {
+    if (!ours) return
+    val cm = clipboard
+    // En segundo plano Android no deja leer el portapapeles (null): se confía en el aviso de cambios.
+    val label = try { cm.primaryClipDescription?.label?.toString() } catch (e: Exception) { null }
+    if (label == null || label == CLIP_LABEL) {
+      try {
+        if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip() else cm.setPrimaryClip(ClipData.newPlainText("", ""))
+      } catch (e: Exception) {
+      }
+    }
+    ours = false
+    cm.removePrimaryClipChangedListener(onClipChanged)
+  }
 
   @Command
   fun openDocument(invoke: Invoke) {

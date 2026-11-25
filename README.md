@@ -4,8 +4,7 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
 [KP Manager para Windows](https://github.com/fmartineze/kpmanager). Lee el mismo fichero de datos
 (`vaults.enc`) desde **OneDrive de Microsoft 365** y nunca lo modifica.
 
-> Estado: versión de prueba (0.2). Abrir y navegar los vaults y el desbloqueo con huella llegarán en las
-> próximas versiones.
+> Estado: versión de prueba (0.3).
 
 ## Qué hace esta versión
 
@@ -22,11 +21,17 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
   - cada vault usa automáticamente el fichero que se llama igual que en Windows o, si no hay ninguno, el
     predeterminado;
   - en la ficha de cada cliente se puede elegir otro o ninguno.
+- **Navegar los vaults en solo lectura** (tocar un cliente):
+  - grupos, búsqueda, ficha de cada entrada, código TOTP, notas en Markdown y adjuntos;
+  - el `.kdbx` se localiza en OneDrive a partir de su ruta de Windows y se guarda una copia en el móvil para
+    abrirlo sin conexión (solo se vuelve a descargar si cambió).
+- **Desbloqueo con huella** (Ajustes).
 - **Copia de seguridad** (Ajustes): cuenta, carpeta, fichero de datos y ficheros de clave, en un fichero
   `.kpmbak` cifrado con la contraseña maestra.
 - Lista de clientes con búsqueda, etiquetas y favoritos, igual que en Windows.
 - Sincronización con OneDrive. Solo descarga el fichero si cambió y, sin conexión, usa la última copia guardada.
-- Se bloquea al pasar a segundo plano y tras 3 minutos sin uso.
+- Se bloquea tras 30 segundos en segundo plano (tiempo para pegar lo copiado en otra app) y tras 3 minutos
+  sin uso.
 
 ## Seguridad
 
@@ -43,6 +48,15 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
 - **Ficheros de clave:** se guardan dentro de la configuración cifrada. Se leen con el selector del sistema
   directamente desde Rust (plugin propio `DocsPlugin`, que la interfaz web no puede llamar): su contenido nunca
   pasa por el WebView. La app no pide permisos de almacenamiento; solo accede al fichero que eliges.
+- **Vaults:** el `.kdbx` se trata como hostil (mismo código que en Windows): tamaño y parámetros de la
+  derivación de clave acotados, iconos validados y notas saneadas. A la interfaz solo llega el árbol sin
+  contraseñas, notas ni semillas TOTP; cada secreto se pide al mostrarlo. La app nunca escribe en el vault.
+- **Portapapeles:** se copia desde Rust (el valor no pasa por la interfaz), marcado como sensible para que
+  Android no lo enseñe en la vista previa, y se borra a los 30 segundos (salvo que hayas copiado otra cosa
+  después) o al bloquear con el botón.
+- **Enlaces:** solo `https`, `http` y `mailto`, y siempre se enseña la dirección real antes de abrirla.
+- **Huella:** la maestra se cifra con una clave AES del almacén de claves de Android que exige huella de
+  seguridad alta en cada uso y que se invalida si se añade una huella nueva. La maestra no pasa por la interfaz.
 - **Copia de seguridad:** cifrada con la maestra (Argon2id + XChaCha20-Poly1305). No incluye el token de
   Microsoft: en el móvil nuevo hay que volver a iniciar sesión. Guárdala en un sitio de confianza: con la
   maestra da acceso a tus ficheros de clave.

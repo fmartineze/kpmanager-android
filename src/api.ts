@@ -54,6 +54,13 @@ export interface KeyFile {
   uses: number;
 }
 
+export interface BioStatus {
+  /** El móvil tiene huella de seguridad alta configurada. */
+  available: boolean;
+  /** El desbloqueo con huella está activado en la app. */
+  enabled: boolean;
+}
+
 export interface Library {
   added: string | null;
   keys: KeyFile[];
@@ -84,6 +91,69 @@ export interface RestoreInfo {
   created: number;
 }
 
+// ── Navegar un vault (mismos tipos que la app de Windows) ──
+
+export type IconView = { kind: "std"; id: number } | { kind: "custom"; id: string };
+
+export interface GroupNode {
+  id: string;
+  parent: string | null;
+  name: string;
+  icon: IconView | null;
+}
+
+export interface EntryRow {
+  id: string;
+  group: string;
+  title: string;
+  username: string;
+  url: string;
+  icon: IconView | null;
+  tags: string[];
+  hasTotp: boolean;
+  hasAttachments: boolean;
+}
+
+/** El árbol del vault: nunca lleva contraseñas, notas ni semillas TOTP. */
+export interface VaultTree {
+  root: string;
+  groups: GroupNode[];
+  entries: EntryRow[];
+  /** Iconos personalizados ya validados, como `data:image/png;base64,…`. */
+  icons: Record<string, string>;
+}
+
+export interface Opened {
+  tree: VaultTree;
+  /** Sin conexión: es la copia guardada en el móvil. */
+  offline: boolean;
+}
+
+export interface FieldInfo {
+  name: string;
+  protected: boolean;
+  value: string | null;
+}
+
+export interface EntryDetail {
+  id: string;
+  title: string;
+  username: string;
+  url: string;
+  notes: string;
+  tags: string[];
+  hasPassword: boolean;
+  hasTotp: boolean;
+  fields: FieldInfo[];
+  attachments: { name: string; size: number }[];
+}
+
+export interface Totp {
+  code: string;
+  validFor: number;
+  period: number;
+}
+
 /** Evento `login`: vuelta del navegador tras iniciar sesión con Microsoft. */
 export interface LoginEvent {
   account: Account | null;
@@ -104,7 +174,8 @@ async function withPicker<T>(f: () => Promise<T>): Promise<T> {
 
 export const api = {
   status: () => invoke<Status>("status"),
-  lock: () => invoke<void>("lock"),
+  /** `clearClipboard`: vaciar también lo copiado (no al bloquear por salir de la app). */
+  lock: (clearClipboard: boolean) => invoke<void>("lock", { clearClipboard }),
   reset: () => invoke<void>("reset"),
   /** Sin argumentos: volver a iniciar sesión con la app desbloqueada. */
   login: (tenant?: string, clientId?: string) => invoke<void>("login", { tenant, clientId }),
@@ -116,6 +187,8 @@ export const api = {
   restoreOpen: (password: string) => invoke<RestoreInfo>("wizard_restore_open", { password }),
   unlock: (password: string) => invoke<Vault[]>("unlock", { password }),
   info: () => invoke<Info>("info"),
+  /** Cambia la carpeta de origen (los vaults); no cambia el fichero de datos. */
+  setFolder: (folderId: string) => invoke<Info>("set_folder", { folderId }),
   sync: () => invoke<SyncResult>("sync"),
   keys: () => invoke<Library>("keys"),
   keyImport: () => withPicker(() => invoke<Library>("key_import")),
@@ -124,7 +197,26 @@ export const api = {
   /** `choice`: `auto`, `none` o el id de un fichero de la biblioteca. */
   vaultKey: (vaultId: string, choice: string) => invoke<Library>("vault_key", { vaultId, choice }),
   backupSave: () => withPicker(() => invoke<string | null>("backup_save")),
+  openVault: (vaultId: string) => invoke<Opened>("open_vault", { vaultId }),
+  closeVault: () => invoke<void>("close_vault"),
+  entryDetail: (vaultId: string, entry: string) => invoke<EntryDetail>("entry_detail", { vaultId, entry }),
+  entryTotp: (vaultId: string, entry: string) => invoke<Totp>("entry_totp", { vaultId, entry }),
+  /** Devuelve el valor para mostrarlo (botón «ver»). */
+  revealSecret: (vaultId: string, entry: string, field: string) => invoke<string>("reveal_secret", { vaultId, entry, field }),
+  /** Copia desde Rust: el valor no pasa por la interfaz. */
+  copySecret: (vaultId: string, entry: string, field: string) => invoke<void>("copy_secret", { vaultId, entry, field }),
+  saveAttachment: (vaultId: string, entry: string, name: string) => withPicker(() => invoke<string | null>("save_attachment", { vaultId, entry, name })),
+  openLink: (url: string) => invoke<void>("open_link", { url }),
+  bioStatus: () => invoke<BioStatus>("bio_status"),
+  /** Pide la huella para guardar la maestra cifrada. `false` si se canceló. */
+  bioEnable: (password: string, title: string, cancel: string) => invoke<boolean>("bio_enable", { password, title, cancel }),
+  bioDisable: () => invoke<void>("bio_disable"),
+  /** `null` si el usuario canceló el diálogo de la huella. */
+  bioUnlock: (title: string, cancel: string) => invoke<Vault[] | null>("bio_unlock", { title, cancel }),
 };
+
+/** Segundos que lo copiado se queda en el portapapeles (igual que `CLIPBOARD_MS` en Rust). */
+export const CLIPBOARD_SECS = 30;
 
 export const errMsg = (e: unknown) => errorText(e);
 export const errCode = (e: unknown) => (e && typeof e === "object" ? (e as { code?: string }).code : undefined);

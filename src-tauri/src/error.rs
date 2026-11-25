@@ -20,6 +20,8 @@ pub enum AppError {
     Json(#[from] serde_json::Error),
     #[error("Sin conexión con Microsoft")]
     Network,
+    #[error("No encontrado")]
+    NotFound,
     /// Mensaje con código estable: la interfaz lo traduce al idioma elegido.
     #[error("{code} {arg}")]
     Msg { code: &'static str, arg: String },
@@ -45,6 +47,7 @@ impl AppError {
             Self::Io(_) => "io",
             Self::Json(_) => "json",
             Self::Network => "network",
+            Self::NotFound => "notFound",
             Self::Msg { code, .. } => code,
         }
     }

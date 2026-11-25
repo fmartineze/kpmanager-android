@@ -90,3 +90,12 @@
 .keyrow-confirm { display: flex; flex-direction: column; gap: 6px; margin-left: 42px; font-size: var(--kp-fs-sm); color: var(--kp-text-2); }
 .btn-ghost.danger { color: var(--kp-danger); }
 .modal-foot .btn-block { flex: 1; }
+
+/* Lista de clientes: botón del fichero de clave */
+.row .btn-icon.plain { flex: none; color: var(--kp-text-3); }
+.row .btn-icon.plain.warn { color: var(--kp-danger); }
+
+/* Ajustes: valor con botón de editar al lado */
+.kv-edit { display: flex; align-items: center; gap: 4px; }
+.kv-edit .kv { flex: 1; min-width: 0; }
+.kv-edit .btn-icon { flex: none; color: var(--kp-text-2); }

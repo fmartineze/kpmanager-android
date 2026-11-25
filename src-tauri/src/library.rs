@@ -37,8 +37,7 @@ pub struct KeyFile {
 }
 
 impl KeyFile {
-    /// Contenido del fichero, para abrir el vault (fase 3).
-    #[allow(dead_code)]
+    /// Contenido del fichero, para abrir el vault.
     pub fn bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
         base64::engine::general_purpose::STANDARD.decode(self.data.as_bytes()).map(Zeroizing::new).map_err(|_| AppError::BadFormat)
     }
@@ -87,6 +86,11 @@ pub struct KeyView {
 impl Library {
     fn get(&self, id: &str) -> Option<&KeyFile> {
         self.keys.iter().find(|k| k.id == id)
+    }
+
+    /// Contenido de un fichero de la biblioteca.
+    pub fn key_bytes(&self, id: &str) -> Result<Zeroizing<Vec<u8>>> {
+        self.get(id).ok_or_else(|| AppError::msg("keyUnknown"))?.bytes()
     }
 
     /// Añade un fichero. El primero que se importa pasa a ser el predeterminado.

@@ -1,6 +1,6 @@
 [package]
 name = "kpmanager-android"
-version = "0.2.0"
+version = "0.3.1"
 description = "KP Manager para Android: consulta de solo lectura de los vaults de KeePass"
 authors = ["fmartineze"]
 license = "MIT"
@@ -28,6 +28,8 @@ sha2 = "0.10"
 base64 = "0.22"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+keepass = { version = "0.17.0", default-features = false, features = ["totp"] }
+uuid = "1"
 
 [profile.release]
 codegen-units = 1
@@ -35,3 +37,6 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+keepass = { version = "0.17.0", features = ["save_kdbx4", "totp"] }

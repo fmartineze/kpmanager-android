@@ -3,6 +3,7 @@
 //! Lee el mismo fichero de datos que la app de Windows (`vaults.enc`) desde OneDrive y nunca lo modifica.
 //! Los secretos (tokens de Microsoft, claves derivadas, contraseñas de los vaults) no salen de Rust.
 
+mod bio;
 mod config;
 mod crypto;
 mod docs;
@@ -10,6 +11,7 @@ mod error;
 mod graph;
 mod library;
 mod model;
+mod vaultdb;
 
 use serde::Serialize;
 use tauri::async_runtime::Mutex;
@@ -70,10 +72,10 @@ fn with_keys(base: &[VaultView], lib: &Library) -> Vec<VaultView> {
         .collect()
 }
 
-/// Descifra el fichero de datos con la maestra y devuelve la lista (y la clave, para próximas descargas).
-fn open_data(password: &str, blob: &[u8]) -> Result<(Keys, Vec<VaultView>)> {
+/// Descifra el fichero de datos con la maestra (y devuelve la clave, para próximas descargas).
+fn open_data(password: &str, blob: &[u8]) -> Result<(Keys, Data)> {
     let (keys, plain) = Keys::decrypt(password, blob)?;
-    Ok((keys, views(&Data::parse(&plain)?)))
+    Ok((keys, Data::parse(&plain)?))
 }
 
 /// Ejecuta trabajo pesado (Argon2) fuera del hilo de la interfaz.
@@ -98,13 +100,14 @@ struct Session {
     cfg_keys: Keys,
     config: Config,
     data_keys: Keys,
-    vaults: Vec<VaultView>,
+    /// Fichero de datos descifrado: lleva las contraseñas de los vaults y nunca sale de Rust.
+    data: Data,
     tokens: Option<Tokens>,
 }
 
 impl Session {
     fn vaults(&self) -> Vec<VaultView> {
-        with_keys(&self.vaults, &self.config.library)
+        with_keys(&views(&self.data), &self.config.library)
     }
 
     fn save(&self, paths: &Paths) -> Result<()> {
@@ -123,6 +126,8 @@ struct AppState {
     paths: Paths,
     http: reqwest::Client,
     inner: Mutex<Inner>,
+    /// Vault abierto en el navegador (uno a la vez, solo en memoria).
+    vault: vaultdb::Session,
 }
 
 #[derive(Serialize)]
@@ -139,9 +144,21 @@ async fn status(state: State<'_, AppState>) -> Result<Status> {
     Ok(Status { configured: state.paths.configured(), unlocked: inner.session.is_some(), version: env!("CARGO_PKG_VERSION") })
 }
 
+/// Bloquea: suelta la configuración, el fichero de datos y el vault abierto.
+///
+/// `clear_clipboard`: vaciar también lo copiado. No se hace al bloquear por salir de la app, que es justo
+/// cuando el usuario va a pegarlo en otra; en ese caso se borra solo pasado su tiempo.
 #[tauri::command]
-async fn lock(state: State<'_, AppState>) -> Result<()> {
+async fn lock(app: AppHandle, state: State<'_, AppState>, clear_clipboard: bool) -> Result<()> {
     state.inner.lock().await.session = None;
+    state.vault.close();
+    if clear_clipboard {
+        let _ = blocking(move || {
+            docs::clear_clipboard(&app);
+            Ok(())
+        })
+        .await;
+    }
     Ok(())
 }
 
@@ -149,6 +166,7 @@ async fn lock(state: State<'_, AppState>) -> Result<()> {
 #[tauri::command]
 async fn reset(state: State<'_, AppState>) -> Result<()> {
     *state.inner.lock().await = Inner::default();
+    state.vault.close();
     state.paths.reset()
 }
 
@@ -213,9 +231,21 @@ fn wizard_token(inner: &Inner) -> Result<String> {
     }
 }
 
+/// Token para navegar por OneDrive: el del asistente o, con la app desbloqueada, el de la sesión.
+async fn browse_token(state: &AppState) -> Result<String> {
+    {
+        let inner = state.inner.lock().await;
+        if inner.session.is_none() {
+            return wizard_token(&inner);
+        }
+    }
+    session_token(state).await
+}
+
+/// Subcarpetas de una carpeta de OneDrive (asistente y Ajustes → Carpeta de origen).
 #[tauri::command]
 async fn wizard_children(state: State<'_, AppState>, id: String) -> Result<Vec<Item>> {
-    let token = wizard_token(&*state.inner.lock().await)?;
+    let token = browse_token(&state).await?;
     graph::children(&state.http, &token, &id).await
 }
 
@@ -244,11 +274,11 @@ async fn wizard_finish(state: State<'_, AppState>, folder_id: String, data_id: S
     if !Keys::looks_valid(&blob) {
         return Err(AppError::msg("notKpmData"));
     }
-    let (data_keys, vaults, cfg_keys) = {
+    let (data_keys, data, cfg_keys) = {
         let blob = blob.clone();
         blocking(move || {
-            let (data_keys, vaults) = open_data(&password, &blob)?;
-            Ok((data_keys, vaults, Paths::new_keys(&password)?))
+            let (data_keys, data) = open_data(&password, &blob)?;
+            Ok((data_keys, data, Paths::new_keys(&password)?))
         })
         .await?
     };
@@ -268,10 +298,11 @@ async fn wizard_finish(state: State<'_, AppState>, folder_id: String, data_id: S
         refresh_token: tokens.refresh.clone(),
         synced_at: Some(config::now()),
         library,
+        vault_files: Default::default(),
     };
     state.paths.write_data(&blob)?;
     state.paths.save(&cfg_keys, &config)?;
-    let s = Session { cfg_keys, config, data_keys, vaults, tokens: Some(tokens) };
+    let s = Session { cfg_keys, config, data_keys, data, tokens: Some(tokens) };
     let out = s.vaults();
     inner.session = Some(s);
     Ok(out)
@@ -329,20 +360,23 @@ async fn wizard_restore_open(state: State<'_, AppState>, password: String) -> Re
 /// Desbloquea con la maestra usando la copia local (funciona sin conexión).
 #[tauri::command]
 async fn unlock(state: State<'_, AppState>, password: String) -> Result<Vec<VaultView>> {
-    let password = Zeroizing::new(password);
+    unlock_with(&state, Zeroizing::new(password)).await
+}
+
+async fn unlock_with(state: &AppState, password: Zeroizing<String>) -> Result<Vec<VaultView>> {
     let paths = state.paths.clone();
-    let (cfg_keys, config, data_keys, vaults) = blocking(move || {
+    let (cfg_keys, config, data_keys, data) = blocking(move || {
         let (cfg_keys, config) = paths.load(&password)?;
         let blob = paths.read_data()?;
         // La maestra abre la configuración pero no los datos: se cambió en Windows después de configurar el móvil.
-        let (data_keys, vaults) = open_data(&password, &blob).map_err(|e| match e {
+        let (data_keys, data) = open_data(&password, &blob).map_err(|e| match e {
             AppError::WrongPassword => AppError::msg("masterChanged"),
             e => e,
         })?;
-        Ok((cfg_keys, config, data_keys, vaults))
+        Ok((cfg_keys, config, data_keys, data))
     })
     .await?;
-    let s = Session { cfg_keys, config, data_keys, vaults, tokens: None };
+    let s = Session { cfg_keys, config, data_keys, data, tokens: None };
     let out = s.vaults();
     state.inner.lock().await.session = Some(s);
     Ok(out)
@@ -357,16 +391,34 @@ struct Info {
     synced_at: Option<u64>,
 }
 
-#[tauri::command]
-async fn info(state: State<'_, AppState>) -> Result<Info> {
-    let inner = state.inner.lock().await;
-    let s = inner.session.as_ref().ok_or(AppError::Locked)?;
-    Ok(Info {
+fn info_of(s: &Session) -> Info {
+    Info {
         account: s.config.account.clone(),
         folder: s.config.folder.path.clone(),
         data_file: s.config.data_file.path.clone(),
         synced_at: s.config.synced_at,
-    })
+    }
+}
+
+#[tauri::command]
+async fn info(state: State<'_, AppState>) -> Result<Info> {
+    let inner = state.inner.lock().await;
+    Ok(info_of(inner.session.as_ref().ok_or(AppError::Locked)?))
+}
+
+/// Cambia la carpeta de origen (donde están los vaults de los clientes). No cambia el fichero de datos.
+#[tauri::command]
+async fn set_folder(state: State<'_, AppState>, folder_id: String) -> Result<Info> {
+    let token = session_token(&state).await?;
+    let folder = graph::item(&state.http, &token, &folder_id).await?;
+    if !folder.folder || folder.id == "root" {
+        return Err(AppError::msg("itemInvalid"));
+    }
+    let mut inner = state.inner.lock().await;
+    let s = inner.session.as_mut().ok_or(AppError::Locked)?;
+    s.config.folder = folder;
+    s.save(&state.paths)?;
+    Ok(info_of(s))
 }
 
 #[derive(Serialize)]
@@ -420,7 +472,7 @@ async fn sync(state: State<'_, AppState>) -> Result<SyncResult> {
         Some(blob) => {
             // Misma clave mientras no cambie la maestra en Windows; si cambió, hay que volver a desbloquear.
             let plain = s.data_keys.open_with_key(&blob)?;
-            s.vaults = views(&Data::parse(&plain)?);
+            s.data = Data::parse(&plain)?;
             state.paths.write_data(&blob)?;
             true
         }
@@ -498,11 +550,215 @@ async fn vault_key(state: State<'_, AppState>, vault_id: String, choice: String)
     {
         let inner = state.inner.lock().await;
         let s = inner.session.as_ref().ok_or(AppError::Locked)?;
-        if !s.vaults.iter().any(|v| v.id == vault_id) {
+        if !s.data.vaults.iter().any(|v| v.id == vault_id) {
             return Err(AppError::msg("vaultUnknown"));
         }
     }
     edit_library(&state, None, |lib| lib.assign(&vault_id, &choice)).await
+}
+
+// ── Navegar un vault (solo lectura) ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Opened {
+    tree: vaultdb::TreeView,
+    /// Sin conexión: se abrió la copia guardada en el móvil.
+    offline: bool,
+}
+
+/// Descarga el `.kdbx` (o usa la copia local si no cambió en OneDrive) y recuerda dónde está.
+async fn fetch_kdbx(state: &AppState, vault_id: &str, windows_path: &str, folder: &Item, known: Option<&Item>) -> Result<Vec<u8>> {
+    let token = session_token(state).await?;
+    let meta = match known {
+        Some(k) => match graph::item(&state.http, &token, &k.id).await {
+            Ok(m) => Some(m),
+            Err(AppError::Msg { code: "itemMissing", .. }) => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
+    let meta = match meta {
+        Some(m) => m,
+        None => graph::locate_vault(&state.http, &token, folder, windows_path).await?,
+    };
+    if let Some(Ok(b)) = known.filter(|k| k.id == meta.id && k.etag == meta.etag).map(|k| state.paths.read_kdbx(&k.id)) {
+        return Ok(b);
+    }
+    let bytes = graph::download(&state.http, &token, &meta.id).await?;
+    state.paths.write_kdbx(&meta.id, &bytes)?;
+    if let Some(k) = known.filter(|k| k.id != meta.id) {
+        state.paths.remove_kdbx(&k.id);
+    }
+    let mut inner = state.inner.lock().await;
+    let s = inner.session.as_mut().ok_or(AppError::Locked)?;
+    s.config.vault_files.insert(vault_id.to_owned(), meta);
+    s.save(&state.paths)?;
+    Ok(bytes)
+}
+
+/// Abre un vault en solo lectura con la contraseña guardada en el fichero de datos y el fichero de clave de la
+/// biblioteca. Devuelve el árbol **sin secretos**.
+#[tauri::command]
+async fn open_vault(state: State<'_, AppState>, vault_id: String) -> Result<Opened> {
+    state.vault.close();
+    let (path, password, keyfile, folder, known) = {
+        let inner = state.inner.lock().await;
+        let s = inner.session.as_ref().ok_or(AppError::Locked)?;
+        let v = s.data.vaults.iter().find(|v| v.id == vault_id).ok_or_else(|| AppError::msg("vaultUnknown"))?;
+        let windows_key = v.keyfile.as_deref().map(file_name);
+        let key = s.config.library.resolve(&v.id, windows_key.as_deref());
+        if key.missing {
+            return Err(AppError::msg_arg("vaultKeyMissing", windows_key.unwrap_or_default()));
+        }
+        let keyfile = key.id.as_deref().map(|id| s.config.library.key_bytes(id)).transpose()?;
+        (v.path.clone(), v.password.clone(), keyfile, s.config.folder.clone(), s.config.vault_files.get(&vault_id).cloned())
+    };
+    let (bytes, offline) = match fetch_kdbx(&state, &vault_id, &path, &folder, known.as_ref()).await {
+        Ok(b) => (b, false),
+        // Sin conexión: la última copia que se abrió en el móvil, si la hay.
+        Err(AppError::Network) => match known.as_ref().and_then(|k| state.paths.read_kdbx(&k.id).ok()) {
+            Some(b) => (b, true),
+            None => return Err(AppError::msg("vaultOffline")),
+        },
+        Err(e) => return Err(e),
+    };
+    let db = blocking(move || vaultdb::open(&bytes, password.as_deref().map(|p| p.as_str()), keyfile.as_deref().map(|k| k.as_slice()))).await?;
+    let tree = vaultdb::tree(&db, true);
+    if state.inner.lock().await.session.is_none() {
+        // Se bloqueó mientras se abría.
+        return Err(AppError::Locked);
+    }
+    state.vault.set(vault_id, db);
+    Ok(Opened { tree, offline })
+}
+
+#[tauri::command]
+fn close_vault(state: State<'_, AppState>) {
+    state.vault.close();
+}
+
+#[tauri::command]
+fn entry_detail(state: State<'_, AppState>, vault_id: String, entry: String) -> Result<vaultdb::EntryDetail> {
+    state.vault.with(&vault_id, |db| vaultdb::detail(db, &entry))
+}
+
+#[tauri::command]
+fn entry_totp(state: State<'_, AppState>, vault_id: String, entry: String) -> Result<vaultdb::TotpView> {
+    state.vault.with(&vault_id, |db| vaultdb::totp(db, &entry))
+}
+
+/// Muestra un campo protegido (botón «ver»). Es lo único que envía un secreto a la interfaz.
+#[tauri::command]
+fn reveal_secret(state: State<'_, AppState>, vault_id: String, entry: String, field: String) -> Result<String> {
+    state.vault.with(&vault_id, |db| vaultdb::secret(db, &entry, &field)).map(|s| s.to_string())
+}
+
+/// Tiempo que lo copiado se queda en el portapapeles.
+const CLIPBOARD_MS: u64 = 30_000;
+
+/// Copia un campo al portapapeles desde Rust: el valor no pasa por la interfaz.
+#[tauri::command]
+async fn copy_secret(app: AppHandle, state: State<'_, AppState>, vault_id: String, entry: String, field: String) -> Result<()> {
+    let text = state.vault.with(&vault_id, |db| vaultdb::secret(db, &entry, &field))?;
+    blocking(move || docs::copy(&app, &text, CLIPBOARD_MS)).await
+}
+
+/// Guarda un adjunto donde elija el usuario. Devuelve el nombre, o nada si canceló.
+#[tauri::command]
+async fn save_attachment(app: AppHandle, state: State<'_, AppState>, vault_id: String, entry: String, name: String) -> Result<Option<String>> {
+    let data = state.vault.with(&vault_id, |db| vaultdb::attachment(db, &entry, &name))?;
+    if data.len() > MAX_ATTACHMENT {
+        return Err(AppError::msg("docTooLarge"));
+    }
+    let suggested = docs::clean_name(&name);
+    blocking(move || docs::save(&app, &suggested, "application/octet-stream", &data)).await
+}
+
+/// Los adjuntos viajan en base64 hasta el selector de Android: se limita el tamaño.
+const MAX_ATTACHMENT: usize = 16 * 1024 * 1024;
+
+/// Abre un enlace de una entrada en el navegador. Solo `https`, `http` y `mailto` (KeePass admite `cmd://`…).
+#[tauri::command]
+fn open_link(app: AppHandle, url: String) -> Result<()> {
+    let parsed = url::Url::parse(url.trim()).map_err(|_| AppError::msg("linkBlocked"))?;
+    if !matches!(parsed.scheme(), "https" | "http" | "mailto") {
+        return Err(AppError::msg("linkBlocked"));
+    }
+    app.opener().open_url(parsed.as_str(), None::<&str>).map_err(|_| AppError::msg("browserFailed"))
+}
+
+// ── Desbloqueo con huella ────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct BioStatus {
+    available: bool,
+    enabled: bool,
+}
+
+#[tauri::command]
+async fn bio_status(app: AppHandle, state: State<'_, AppState>) -> Result<BioStatus> {
+    let enabled = state.paths.bio_enabled();
+    let available = blocking(move || Ok(bio::available(&app))).await?;
+    Ok(BioStatus { available, enabled })
+}
+
+/// Activa la huella: comprueba la maestra y la guarda cifrada con la clave protegida por huella.
+#[tauri::command]
+async fn bio_enable(app: AppHandle, state: State<'_, AppState>, password: String, title: String, cancel: String) -> Result<bool> {
+    if state.inner.lock().await.session.is_none() {
+        return Err(AppError::Locked);
+    }
+    let password = Zeroizing::new(password);
+    let paths = state.paths.clone();
+    let sealed = blocking(move || {
+        // Debe ser la maestra con la que se abre este móvil.
+        paths.load(&password)?;
+        bio::enroll(&app, &password, &bio::Prompt { title, cancel })
+    })
+    .await?;
+    match sealed {
+        Some(s) => {
+            state.paths.write_bio(&s)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+#[tauri::command]
+async fn bio_disable(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    state.paths.remove_bio();
+    blocking(move || {
+        bio::remove(&app);
+        Ok(())
+    })
+    .await
+}
+
+/// Desbloquea con la huella. `None` si el usuario canceló (entonces escribe la maestra).
+#[tauri::command]
+async fn bio_unlock(app: AppHandle, state: State<'_, AppState>, title: String, cancel: String) -> Result<Option<Vec<VaultView>>> {
+    let sealed = state.paths.read_bio().map_err(|_| AppError::msg("bioInvalidated"))?;
+    let password = match blocking(move || bio::decrypt(&app, &sealed, &bio::Prompt { title, cancel })).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            // Huellas cambiadas: la clave ya no existe; hay que volver a activarla con la maestra.
+            if matches!(e, AppError::Msg { code: "bioInvalidated", .. }) {
+                state.paths.remove_bio();
+            }
+            return Err(e);
+        }
+    };
+    match unlock_with(&state, password).await {
+        Ok(v) => Ok(Some(v)),
+        Err(AppError::WrongPassword) => {
+            state.paths.remove_bio();
+            Err(AppError::msg("bioInvalidated"))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ── Copia de seguridad ───────────────────────────────────────────────────────────────────────────
@@ -525,6 +781,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(docs::init())
+        .plugin(bio::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             app.manage(AppState {
@@ -535,6 +792,7 @@ pub fn run() {
                     .build()
                     .expect("cliente HTTP"),
                 inner: Mutex::new(Inner::default()),
+                vault: vaultdb::Session::default(),
             });
             let handle = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
@@ -558,6 +816,7 @@ pub fn run() {
             wizard_restore_open,
             unlock,
             info,
+            set_folder,
             sync,
             keys,
             key_import,
@@ -565,6 +824,18 @@ pub fn run() {
             key_default,
             vault_key,
             backup_save,
+            open_vault,
+            close_vault,
+            entry_detail,
+            entry_totp,
+            reveal_secret,
+            copy_secret,
+            save_attachment,
+            open_link,
+            bio_status,
+            bio_enable,
+            bio_disable,
+            bio_unlock,
         ])
         .run(tauri::generate_context!())
         .expect("error al arrancar KP Manager");
@@ -580,7 +851,7 @@ mod tests {
     fn reads_a_data_file_written_by_the_windows_app() {
         let blob = include_bytes!("../tests/fixtures/vaults-windows.enc");
         assert!(matches!(open_data("otra", blob), Err(AppError::WrongPassword)));
-        let (_, v) = open_data("prueba-compat", blob).unwrap();
+        let v = views(&open_data("prueba-compat", blob).unwrap().1);
         assert_eq!(v.len(), 2);
         assert_eq!((v[0].client.as_str(), v[0].favorite, v[0].file.as_str()), ("Cliente Ejemplo", true, "ejemplo.kdbx"));
         assert_eq!(v[0].keyfile.as_deref(), Some("comun.keyx"));

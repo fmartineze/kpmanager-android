@@ -298,6 +298,126 @@ pub async fn find_data_files(http: &reqwest::Client, token: &str, folder: &str) 
     Ok(items)
 }
 
+/// Parte de una ruta de Windows que queda dentro de la carpeta de origen.
+///
+/// `C:\Users\ana\OneDrive - Org\Clientes\Acme\acme.kdbx` con la carpeta `/Clientes` da
+/// `["Acme", "acme.kdbx"]`. Si la carpeta aparece varias veces se usa la última. `None` si no aparece o si
+/// algún tramo no es un nombre normal (`..`, `:`).
+pub fn relative_to(folder_path: &str, windows_path: &str) -> Option<Vec<String>> {
+    let folder: Vec<&str> = folder_path.split('/').filter(|c| !c.is_empty()).collect();
+    let parts: Vec<&str> = windows_path.split(['\\', '/']).filter(|c| !c.is_empty()).collect();
+    if folder.is_empty() || parts.len() <= folder.len() {
+        return None;
+    }
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    let start = (0..parts.len() - folder.len())
+        .rev()
+        .find(|&i| folder.iter().zip(&parts[i..]).all(|(f, p)| same(f, p)))?;
+    let rest: Vec<String> = parts[start + folder.len()..].iter().map(|s| (*s).to_owned()).collect();
+    if rest.is_empty() || rest.iter().any(|c| c == "." || c == ".." || c.contains(':')) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Cuántos tramos finales comparten dos rutas (para elegir entre ficheros con el mismo nombre).
+fn common_suffix(a: &str, b: &str) -> usize {
+    let split = |s: &str| -> Vec<String> { s.split(['\\', '/']).filter(|c| !c.is_empty()).map(str::to_lowercase).collect() };
+    let (a, b) = (split(a), split(b));
+    a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
+}
+
+fn file_name(windows_path: &str) -> String {
+    windows_path.rsplit(['\\', '/']).next().unwrap_or("").to_owned()
+}
+
+/// Elemento por ruta relativa a una carpeta (`/items/{id}:/a/b.kdbx`). Cada tramo se codifica.
+async fn item_by_path(http: &reqwest::Client, token: &str, folder: &str, rel: &[String]) -> Result<Item> {
+    let folder = check_id(folder)?;
+    let mut url = url::Url::parse(GRAPH).map_err(|_| AppError::msg("internal"))?;
+    {
+        let mut seg = url.path_segments_mut().map_err(|_| AppError::msg("internal"))?;
+        seg.extend(["me", "drive", "items", &format!("{folder}:")]);
+        seg.extend(rel);
+    }
+    url.set_query(Some(SELECT));
+    let v = get_json(http, token, url.as_str()).await?;
+    to_item(&v).ok_or(AppError::BadFormat)
+}
+
+/// Localiza en OneDrive el `.kdbx` de un vault a partir de su ruta de Windows.
+pub async fn locate_vault(http: &reqwest::Client, token: &str, folder: &Item, windows_path: &str) -> Result<Item> {
+    let name = file_name(windows_path);
+    let rel = relative_to(&folder.path, windows_path);
+    // El mensaje dice qué se buscó: la ruta esperada dentro de OneDrive o, si no se pudo calcular, el nombre.
+    let tried = match &rel {
+        Some(r) => format!("{}/{}", folder.path.trim_end_matches('/'), r.join("/")),
+        None => name.clone(),
+    };
+    let not_found = || AppError::msg_arg("vaultNotInOneDrive", tried.clone());
+    let is_it = |i: &Item| !i.folder && i.name.eq_ignore_ascii_case(&name);
+    let best = |found: Vec<Item>| found.into_iter().filter(is_it).max_by_key(|i| common_suffix(&i.path, windows_path));
+
+    // 1. La misma ruta relativa que en Windows.
+    if let Some(rel) = &rel {
+        match item_by_path(http, token, &folder.id, rel).await {
+            Ok(i) if !i.folder => return Ok(i),
+            Ok(_) | Err(AppError::Msg { code: "itemMissing", .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if name.is_empty() {
+        return Err(not_found());
+    }
+    let search = |scope: Vec<String>| {
+        let name = name.clone();
+        async move {
+            let mut url = url::Url::parse(GRAPH).map_err(|_| AppError::msg("internal"))?;
+            {
+                let mut seg = url.path_segments_mut().map_err(|_| AppError::msg("internal"))?;
+                seg.extend(["me", "drive"]);
+                seg.extend(scope);
+                seg.push(&format!("search(q='{}')", name.replace('\'', "''")));
+            }
+            url.set_query(Some(&format!("{SELECT}&$top=200")));
+            // Una búsqueda que Graph no admite (o falla) no es definitiva: se sigue con el siguiente método.
+            match get_all(http, token, url.to_string()).await {
+                Ok(v) => Ok(v),
+                Err(AppError::Msg { code: "graphError" | "itemMissing" | "graphForbidden", .. }) => Ok(Vec::new()),
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    // 2. Por nombre dentro de la carpeta de origen.
+    if let Some(i) = best(search(vec!["items".into(), check_id(&folder.id)?.to_owned()]).await?) {
+        return Ok(i);
+    }
+    // 3. Por nombre en todo el OneDrive (el vault puede estar fuera de la carpeta de origen).
+    if let Some(i) = best(search(vec!["root".into()]).await?) {
+        return Ok(i);
+    }
+    // 4. Recorriendo las subcarpetas de la de origen (la búsqueda de Graph tarda en indexar ficheros nuevos).
+    let mut queue = std::collections::VecDeque::from([folder.id.clone()]);
+    let mut visited = 0;
+    while let Some(id) = queue.pop_front() {
+        visited += 1;
+        if visited > 500 {
+            break;
+        }
+        let id = check_id(&id)?.to_owned();
+        let items = get_all(http, token, format!("{GRAPH}/me/drive/items/{id}/children?{SELECT}&$top=200")).await?;
+        for i in items {
+            if i.folder {
+                queue.push_back(i.id);
+            } else if is_it(&i) {
+                return Ok(i);
+            }
+        }
+    }
+    Err(not_found())
+}
+
 pub async fn download(http: &reqwest::Client, token: &str, id: &str) -> Result<Vec<u8>> {
     let id = check_id(id)?;
     let resp = http.get(format!("{GRAPH}/me/drive/items/{id}/content")).bearer_auth(token).send().await?;
@@ -349,6 +469,21 @@ mod tests {
         assert!(p.code_from(&bad).is_err());
         let denied = url::Url::parse(&format!("kpmanager://auth?error=access_denied&error_description=x&state={}", q["state"])).unwrap();
         assert!(matches!(p.code_from(&denied), Err(AppError::Msg { code: "loginDenied", ref arg }) if arg == "access_denied"));
+    }
+
+    #[test]
+    fn windows_paths_map_into_the_source_folder() {
+        let p = r"C:\Users\ana\OneDrive - Org\Clientes\Acme\acme.kdbx";
+        assert_eq!(relative_to("/Clientes", p).unwrap(), ["Acme", "acme.kdbx"]);
+        assert_eq!(relative_to("/clientes", p).unwrap(), ["Acme", "acme.kdbx"], "sin distinguir mayúsculas");
+        assert_eq!(relative_to("/Trabajo/Clientes", r"D:\OD\Trabajo\Clientes\x.kdbx").unwrap(), ["x.kdbx"]);
+        assert_eq!(relative_to("/A", r"C:\A\B\A\c.kdbx").unwrap(), ["c.kdbx"], "la última aparición");
+        assert!(relative_to("/Otra", p).is_none());
+        assert!(relative_to("/Clientes", r"C:\Clientes").is_none());
+        assert!(relative_to("/Clientes", r"C:\Clientes\..\x.kdbx").is_none());
+        assert_eq!(common_suffix("/Clientes/Acme/acme.kdbx", p), 3);
+        assert_eq!(common_suffix("/Otros/acme.kdbx", p), 1);
+        assert_eq!(file_name(p), "acme.kdbx");
     }
 
     #[test]

@@ -93,6 +93,29 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, file_name: &str, mime: &str, data: &
     }
 }
 
+/// Copia un texto al portapapeles como contenido sensible; se borra a los `clear_after_ms`.
+#[cfg(target_os = "android")]
+pub fn copy<R: Runtime>(app: &AppHandle<R>, text: &str, clear_after_ms: u64) -> Result<()> {
+    let args = serde_json::json!({ "text": text, "clearAfterMs": clear_after_ms });
+    handle(app)?.run_mobile_plugin::<serde_json::Value>("copyText", args).map(|_| ()).map_err(|_| AppError::msg("copyFailed"))
+}
+
+/// Borra del portapapeles lo último que copió la app (si nadie copió otra cosa después).
+#[cfg(target_os = "android")]
+pub fn clear_clipboard<R: Runtime>(app: &AppHandle<R>) {
+    if let Ok(h) = handle(app) {
+        let _ = h.run_mobile_plugin::<serde_json::Value>("clearClipboard", serde_json::json!({}));
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn copy<R: Runtime>(_app: &AppHandle<R>, _text: &str, _clear_after_ms: u64) -> Result<()> {
+    Err(AppError::msg("unsupported"))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn clear_clipboard<R: Runtime>(_app: &AppHandle<R>) {}
+
 #[cfg(not(target_os = "android"))]
 pub fn open<R: Runtime>(_app: &AppHandle<R>, _max_bytes: usize) -> Result<Option<Picked>> {
     Err(AppError::msg("unsupported"))

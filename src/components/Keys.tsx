@@ -81,7 +81,7 @@ function autoText(t: ReturnType<typeof useT>, v: Vault, auto: Vault["key"] | nul
 }
 
 /** Ficha de un vault: qué fichero de clave usa en este móvil. */
-export function VaultSheet({ vault, keys, auto, busy, onClose, onChoose, onImport }: {
+export function VaultSheet({ vault, keys, auto, busy, onClose, onChoose, onImport, onOpen }: {
   vault: Vault;
   keys: KeyFile[];
   /** Cómo quedaría en automático (para explicarlo aunque ahora esté elegido a mano). */
@@ -90,6 +90,7 @@ export function VaultSheet({ vault, keys, auto, busy, onClose, onChoose, onImpor
   onClose: () => void;
   onChoose: (choice: string) => void;
   onImport: () => void;
+  onOpen: () => void;
 }) {
   const t = useT();
   const current = vault.key.mode === "manual" ? vault.key.id ?? "auto" : vault.key.mode;
@@ -100,7 +101,13 @@ export function VaultSheet({ vault, keys, auto, busy, onClose, onChoose, onImpor
   ];
 
   return (
-    <Modal title={vault.client} subtitle={vault.file} icon={<IconKey className="s16" />} onClose={onClose}>
+    <Modal
+      title={vault.client}
+      subtitle={vault.file}
+      icon={<IconKey className="s16" />}
+      onClose={onClose}
+      footer={<button className="btn btn-primary btn-block" onClick={onOpen} disabled={busy || vault.key.missing}>{t("vault.openVault")}</button>}
+    >
       <div className="section">
         <div className="kv"><span>{t("vault.windowsKey")}</span><b>{vault.keyfile ?? t("vault.noWindowsKey")}</b></div>
       </div>
@@ -124,7 +131,6 @@ export function VaultSheet({ vault, keys, auto, busy, onClose, onChoose, onImpor
           </>
         )}
       </div>
-      <Note>{t("list.soon")}</Note>
     </Modal>
   );
 }

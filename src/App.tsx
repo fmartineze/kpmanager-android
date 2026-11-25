@@ -1,19 +1,28 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, errMsg, Info, isNetwork, KeyFile, KeyState, Library, LoginEvent, pickerOpen, Status, Vault } from "./api";
+import { api, BioStatus, errCode, errMsg, Info, isNetwork, KeyFile, KeyState, Library, LoginEvent, pickerOpen, Status, Vault, VaultTree } from "./api";
 import { rich, useT } from "./i18n";
 import { setThemePref, ThemePref } from "./theme";
 import { Wizard } from "./components/Wizard";
 import { KeysModal, VaultSheet } from "./components/Keys";
+import { VaultBrowser } from "./components/VaultBrowser";
+import { FolderPicker } from "./components/FolderPicker";
 import { Modal } from "./components/Modal";
 import { Alert, Note, Segmented } from "./components/ui";
-import { IconAlert, IconCheck, IconDownload, IconKey, IconLock, IconRefresh, IconSearch, IconSettings, IconShield, IconStar, IconX } from "./components/Icons";
+import { IconAlert, IconCheck, IconDownload, IconEdit, IconFingerprint, IconKey, IconLock, IconRefresh, IconSearch, IconSettings, IconShield, IconStar, IconX } from "./components/Icons";
 
 type Phase = "loading" | "wizard" | "locked" | "ready";
 type Toast = { msg: string; kind: "ok" | "error"; key: number } | null;
 
-/** Sin actividad durante este tiempo, se bloquea. Al pasar a segundo plano se bloquea en el acto. */
+/** Sin actividad durante este tiempo, se bloquea. */
 const AUTO_LOCK_MS = 3 * 60 * 1000;
+/**
+ * En segundo plano se bloquea pasado este margen: da tiempo a pegar en otra app lo copiado y volver sin
+ * escribir otra vez la maestra.
+ */
+const BACKGROUND_GRACE_MS = 30 * 1000;
+/** Errores al abrir un vault que se arreglan eligiendo otro fichero de clave. */
+const KEY_ERRORS = ["vaultKeyMissing", "vaultWrongKey", "vaultKeyfile", "vaultNoCredentials"];
 
 const initial = (s: string) => (s.trim()[0] ?? "?").toUpperCase();
 const hue = (s: string) => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % 6;
@@ -35,6 +44,35 @@ function Unlock({ onUnlocked }: { onUnlocked: (v: Vault[]) => void }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [shake, setShake] = useState(false);
+  const [bio, setBio] = useState(false);
+
+  const tryBio = useCallback(async () => {
+    setError("");
+    try {
+      const v = await api.bioUnlock(t("unlock.bioTitle"), t("unlock.bioCancel"));
+      if (v) onUnlocked(v);
+    } catch (e) {
+      setError(errMsg(e));
+      if (errCode(e) === "bioInvalidated") setBio(false);
+    }
+  }, [onUnlocked, t]);
+
+  // Con la huella activada se pide sola al aparecer (o al volver a la app si se bloqueó en segundo plano).
+  useEffect(() => {
+    let done = false;
+    const go = () => {
+      if (done || document.visibilityState !== "visible") return;
+      done = true;
+      tryBio();
+    };
+    api.bioStatus().then((s) => {
+      if (!s.enabled || !s.available) return;
+      setBio(true);
+      go();
+    }).catch(() => {});
+    document.addEventListener("visibilitychange", go);
+    return () => document.removeEventListener("visibilitychange", go);
+  }, [tryBio]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -67,23 +105,32 @@ function Unlock({ onUnlocked }: { onUnlocked: (v: Vault[]) => void }) {
         <button className="btn btn-primary btn-block" disabled={busy || !pw}>
           {busy && <span className="spin" />} {busy ? t("unlock.busy") : t("unlock.unlock")}
         </button>
+        {bio && (
+          <button type="button" className="btn btn-secondary btn-block" onClick={tryBio} disabled={busy}>
+            <IconFingerprint className="s16" /> {t("unlock.bio")}
+          </button>
+        )}
       </form>
     </div>
   );
 }
 
-function Settings({ version, keyCount, onClose, onReset, onKeys, toast }: {
+function Settings({ version, keyCount, onClose, onReset, onKeys, onFolder, toast }: {
   version: string;
   keyCount: number;
   onClose: () => void;
   onReset: () => void;
   onKeys: () => void;
+  onFolder: () => void;
   toast: (m: string, k?: "ok" | "error") => void;
 }) {
   const t = useT();
   const [info, setInfo] = useState<Info | null>(null);
   const [confirm, setConfirm] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [bio, setBio] = useState<BioStatus | null>(null);
+  const [bioPw, setBioPw] = useState("");
+  const [bioBusy, setBioBusy] = useState(false);
   const [theme, setTheme] = useState<ThemePref>(() => {
     try {
       const v = localStorage.getItem("kp.theme");
@@ -95,6 +142,7 @@ function Settings({ version, keyCount, onClose, onReset, onKeys, toast }: {
 
   useEffect(() => {
     api.info().then(setInfo).catch(() => {});
+    api.bioStatus().then(setBio).catch(() => {});
     const un = listen<LoginEvent>("login", ({ payload }) => {
       if (payload.account) {
         toast(t("wiz.signedAs", { name: payload.account.upn }).replace(/<\/?b>/g, ""));
@@ -108,6 +156,27 @@ function Settings({ version, keyCount, onClose, onReset, onKeys, toast }: {
   }, []);
 
   const when = info?.syncedAt ? new Date(info.syncedAt * 1000).toLocaleString() : t("set.never");
+
+  async function enableBio(e: FormEvent) {
+    e.preventDefault();
+    setBioBusy(true);
+    try {
+      if (await api.bioEnable(bioPw, t("set.bioTitle"), t("common.cancel"))) {
+        setBio({ available: true, enabled: true });
+        toast(t("set.bioEnabled"));
+      }
+      setBioPw("");
+    } catch (err) {
+      toast(errMsg(err), "error");
+    } finally {
+      setBioBusy(false);
+    }
+  }
+
+  async function disableBio() {
+    await api.bioDisable().catch(() => {});
+    setBio((b) => (b ? { ...b, enabled: false } : b));
+  }
 
   async function backup() {
     setSaving(true);
@@ -125,12 +194,41 @@ function Settings({ version, keyCount, onClose, onReset, onKeys, toast }: {
     <Modal title={t("set.title")} icon={<IconSettings className="s16" />} onClose={onClose}>
       <div className="section">
         <div className="kv"><span>{t("set.account")}</span><b>{info?.account.upn ?? "…"}</b></div>
-        <div className="kv"><span>{t("set.folder")}</span><b>{info?.folder ?? "…"}</b></div>
+        <div className="kv-edit">
+          <div className="kv"><span>{t("set.folder")}</span><b>{info?.folder ?? "…"}</b></div>
+          <button className="btn btn-icon plain" onClick={onFolder} aria-label={t("set.folderChange")}><IconEdit className="s16" /></button>
+        </div>
         <div className="kv"><span>{t("set.data")}</span><b>{info?.dataFile ?? "…"}</b></div>
         <div className="kv"><span>{t("set.synced")}</span><b>{when}</b></div>
         <div className="btns">
           <button className="btn btn-secondary btn-sm" onClick={() => api.login().catch((e) => toast(errMsg(e), "error"))}>{t("set.relogin")}</button>
         </div>
+      </div>
+      <div className="section">
+        <div className="section-title">{t("set.bio")}</div>
+        {!bio ? null : !bio.available ? (
+          <Note>{t("set.bioUnavailable")}</Note>
+        ) : bio.enabled ? (
+          <>
+            <div className="kv"><span>{t("set.bio")}</span><b>{t("set.bioOn")}</b></div>
+            <div className="btns">
+              <button className="btn btn-secondary btn-sm" onClick={disableBio}>{t("set.bioDisable")}</button>
+            </div>
+          </>
+        ) : (
+          <form className="section" onSubmit={enableBio}>
+            <Note>{t("set.bioHelp")}</Note>
+            <div className="input">
+              <IconKey className="s16" />
+              <input className="input-el" type="password" autoComplete="off" placeholder={t("set.bioMaster")} value={bioPw} onChange={(e) => setBioPw(e.target.value)} />
+            </div>
+            <div className="btns">
+              <button className="btn btn-secondary btn-sm" disabled={!bioPw || bioBusy}>
+                {bioBusy ? <span className="spin" /> : <IconFingerprint className="s14" />} {t("set.bioEnable")}
+              </button>
+            </div>
+          </form>
+        )}
       </div>
       <div className="section">
         <div className="section-title">{t("set.keys")}</div>
@@ -196,7 +294,10 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [keys, setKeys] = useState<KeyFile[]>([]);
   const [keysOpen, setKeysOpen] = useState(false);
+  const [folderOpen, setFolderOpen] = useState(false);
   const [libBusy, setLibBusy] = useState(false);
+  const [browsing, setBrowsing] = useState<{ vault: Vault; tree: VaultTree; offline: boolean } | null>(null);
+  const [opening, setOpening] = useState<string | null>(null);
   const toastTimer = useRef<number>(0);
 
   const showToast = useCallback((msg: string, kind: "ok" | "error" = "ok") => {
@@ -215,8 +316,11 @@ export default function App() {
     refreshStatus().catch(() => setPhase("wizard"));
   }, [refreshStatus]);
 
-  const lock = useCallback(async () => {
-    await api.lock().catch(() => {});
+  /** `clearClipboard`: no al bloquear por salir de la app (lo copiado es para pegarlo en otra). */
+  const lock = useCallback(async (clearClipboard = true) => {
+    await api.lock(clearClipboard).catch(() => {});
+    setBrowsing(null);
+    setOpening(null);
     setVaults([]);
     setQuery("");
     setTag(null);
@@ -224,15 +328,29 @@ export default function App() {
     setSelected(null);
     setKeys([]);
     setKeysOpen(false);
+    setFolderOpen(false);
     setPhase((p) => (p === "ready" ? "locked" : p));
   }, []);
 
-  // Al pasar a segundo plano se bloquea (y se descarta la lista). Durante el asistente no: hay que ir al navegador.
+  // En segundo plano se bloquea pasado el margen (y se descarta la lista). Durante el asistente no: hay que ir al
+  // navegador. Con el selector de ficheros abierto tampoco: también pasa la app a segundo plano.
   useEffect(() => {
     if (phase !== "ready") return;
-    // Excepto con el selector de ficheros abierto: también pasa la app a segundo plano.
-    const onHide = () => document.visibilityState === "hidden" && !pickerOpen() && lock();
-    document.addEventListener("visibilitychange", onHide);
+    let hiddenAt = 0;
+    let bgTimer = 0;
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        if (pickerOpen()) return;
+        hiddenAt = Date.now();
+        // Puede no dispararse con la app en segundo plano: por eso también se comprueba al volver.
+        bgTimer = window.setTimeout(() => lock(false), BACKGROUND_GRACE_MS);
+      } else {
+        window.clearTimeout(bgTimer);
+        if (hiddenAt && Date.now() - hiddenAt >= BACKGROUND_GRACE_MS) lock(false);
+        hiddenAt = 0;
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     let timer = window.setTimeout(lock, AUTO_LOCK_MS);
     const reset = () => {
       window.clearTimeout(timer);
@@ -241,7 +359,8 @@ export default function App() {
     const events = ["pointerdown", "keydown", "scroll"] as const;
     events.forEach((e) => window.addEventListener(e, reset, { passive: true }));
     return () => {
-      document.removeEventListener("visibilitychange", onHide);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearTimeout(bgTimer);
       window.clearTimeout(timer);
       events.forEach((e) => window.removeEventListener(e, reset));
     };
@@ -291,6 +410,26 @@ export default function App() {
   );
   const importKey = () => libAction(api.keyImport, (l) => (l.added ? t("keys.added", { name: l.added }) : null));
 
+  const openVault = async (v: Vault) => {
+    if (opening) return;
+    setOpening(v.id);
+    try {
+      const r = await api.openVault(v.id);
+      setBrowsing({ vault: v, tree: r.tree, offline: r.offline });
+    } catch (e) {
+      showToast(errMsg(e), "error");
+      // Si es cosa del fichero de clave, se abre su ficha para elegir otro.
+      if (KEY_ERRORS.includes(errCode(e) ?? "")) setSelected(v.id);
+    } finally {
+      setOpening(null);
+    }
+  };
+
+  const closeVault = () => {
+    api.closeVault().catch(() => {});
+    setBrowsing(null);
+  };
+
   const unlocked = (v: Vault[]) => {
     setVaults(v);
     setPhase("ready");
@@ -319,6 +458,8 @@ export default function App() {
   if (phase === "loading") body = <div className="empty"><span className="spin lg" /></div>;
   else if (phase === "wizard") body = <Wizard onDone={(v) => { refreshStatus(); unlocked(v); }} />;
   else if (phase === "locked") body = <Unlock onUnlocked={unlocked} />;
+  else if (browsing)
+    body = <VaultBrowser vault={browsing.vault} tree={browsing.tree} offline={browsing.offline} onBack={closeVault} notify={showToast} />;
   else
     body = (
       <>
@@ -334,7 +475,7 @@ export default function App() {
                 {syncing ? <span className="spin" /> : <IconRefresh />}
               </button>
               <button className="btn btn-icon" aria-label={t("tip.settings")} onClick={() => setSettings(true)}><IconSettings /></button>
-              <button className="btn btn-icon" aria-label={t("tip.lock")} onClick={lock}><IconLock /></button>
+              <button className="btn btn-icon" aria-label={t("tip.lock")} onClick={() => lock()}><IconLock /></button>
             </div>
           </div>
           <div className="search">
@@ -369,7 +510,7 @@ export default function App() {
             {filtered.map((v, i) => (
               <div key={v.id} className={`row tall ${selected === v.id ? "is-focus" : ""}`}
                 style={{ animation: "kp-fade-up var(--kp-dur-base) var(--kp-ease-out) backwards", animationDelay: `${Math.min(i, 12) * 22}ms` }}>
-                <button className="row-main" onClick={() => setSelected(v.id)}>
+                <button className="row-main" onClick={() => openVault(v)} disabled={!!opening}>
                   <span className={`avatar av-${hue(v.client)}`}>{initial(v.client)}</span>
                   <span className="row-text">
                     <span className="row-name">{v.client}</span>
@@ -386,6 +527,10 @@ export default function App() {
                     </span>
                   )}
                   {v.favorite && <span className="row-fav"><IconStar className="s14" /></span>}
+                  {opening === v.id && <span className="spin" aria-label={t("vault.opening", { name: v.client })} />}
+                </button>
+                <button className={`btn btn-icon plain ${v.key.missing ? "warn" : ""}`} onClick={() => setSelected(v.id)} aria-label={t("vault.keySettings")}>
+                  <IconKey className="s16" />
                 </button>
               </div>
             ))}
@@ -400,6 +545,25 @@ export default function App() {
             onClose={() => setSelected(null)}
             onChoose={(choice) => libAction(() => api.vaultKey(selectedVault.id, choice))}
             onImport={importKey}
+            onOpen={() => {
+              const v = selectedVault;
+              setSelected(null);
+              openVault(v);
+            }}
+          />
+        )}
+        {folderOpen && (
+          <FolderPicker
+            onClose={() => setFolderOpen(false)}
+            onPick={async (f) => {
+              try {
+                const info = await api.setFolder(f.id);
+                setFolderOpen(false);
+                showToast(t("set.folderChanged", { path: info.folder }));
+              } catch (e) {
+                showToast(errMsg(e), "error");
+              }
+            }}
           />
         )}
         {keysOpen && (
@@ -420,6 +584,10 @@ export default function App() {
             onKeys={() => {
               setSettings(false);
               setKeysOpen(true);
+            }}
+            onFolder={() => {
+              setSettings(false);
+              setFolderOpen(true);
             }}
             onClose={() => setSettings(false)}
             onReset={async () => {

@@ -4,6 +4,9 @@
 //!   Cifrado con la contraseña maestra (mismo contenedor KPM1 que `vaults.enc`): sin la maestra no sirve de nada.
 //! - `vaults.enc`: copia local del fichero de datos de OneDrive, tal cual (ya va cifrado), para usar la app
 //!   sin conexión.
+//! - `bio.bin`: la maestra cifrada con una clave del almacén de Android que exige huella (si se activó).
+//! - `kdbx/<id>.kdbx`: copia de los vaults ya abiertos en el móvil, tal cual (los cifra KeePass), para abrirlos
+//!   sin conexión. Solo se descargan de nuevo si cambiaron en OneDrive.
 //!
 //! La copia de seguridad (`.kpmbak`) lleva lo mismo que `config.kpm` salvo el token de Microsoft, cifrada con
 //! la contraseña maestra: sirve para configurar otro móvil sin repetir el asistente.
@@ -31,6 +34,9 @@ pub struct Config {
     /// Biblioteca de ficheros de clave de este móvil.
     #[serde(default)]
     pub library: Library,
+    /// Dónde está en OneDrive el `.kdbx` de cada vault (id del vault → elemento, con el eTag de la copia local).
+    #[serde(default)]
+    pub vault_files: std::collections::BTreeMap<String, Item>,
 }
 
 const BACKUP_KIND: &str = "kpmanager-android-backup";
@@ -124,6 +130,52 @@ impl Paths {
         self.dir.join("vaults.enc")
     }
 
+    fn kdbx_dir(&self) -> PathBuf {
+        self.dir.join("kdbx")
+    }
+
+    /// Ruta de la copia local de un `.kdbx`. El id es de OneDrive: solo letras, cifras y `!`.
+    fn kdbx(&self, item_id: &str) -> Result<PathBuf> {
+        if item_id.is_empty() || item_id.len() > 128 || !item_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '!') {
+            return Err(AppError::msg("itemInvalid"));
+        }
+        Ok(self.kdbx_dir().join(format!("{item_id}.kdbx")))
+    }
+
+    pub fn read_kdbx(&self, item_id: &str) -> Result<Vec<u8>> {
+        Ok(std::fs::read(self.kdbx(item_id)?)?)
+    }
+
+    pub fn write_kdbx(&self, item_id: &str, bytes: &[u8]) -> Result<()> {
+        write_atomic(&self.kdbx(item_id)?, bytes)
+    }
+
+    pub fn remove_kdbx(&self, item_id: &str) {
+        if let Ok(p) = self.kdbx(item_id) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    fn bio(&self) -> PathBuf {
+        self.dir.join("bio.bin")
+    }
+
+    pub fn bio_enabled(&self) -> bool {
+        self.bio().is_file()
+    }
+
+    pub fn read_bio(&self) -> Result<Vec<u8>> {
+        Ok(std::fs::read(self.bio())?)
+    }
+
+    pub fn write_bio(&self, sealed: &[u8]) -> Result<()> {
+        write_atomic(&self.bio(), sealed)
+    }
+
+    pub fn remove_bio(&self) {
+        let _ = std::fs::remove_file(self.bio());
+    }
+
     pub fn configured(&self) -> bool {
         self.config().is_file() && self.data().is_file()
     }
@@ -158,7 +210,12 @@ impl Paths {
 
     /// Borra todo lo de este teléfono (Ajustes → Restablecer).
     pub fn reset(&self) -> Result<()> {
-        for p in [self.config(), self.data()] {
+        match std::fs::remove_dir_all(self.kdbx_dir()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        for p in [self.config(), self.data(), self.bio()] {
             match std::fs::remove_file(&p) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -198,6 +255,7 @@ mod tests {
             refresh_token: Some(Zeroizing::new("secreto-de-refresco".into())),
             synced_at: None,
             library: Library::default(),
+            vault_files: Default::default(),
         }
     }
 
@@ -217,8 +275,12 @@ mod tests {
         assert_eq!(c.refresh_token.as_deref().map(|s| s.as_str()), Some("secreto-de-refresco"));
 
         assert!(paths.write_data(b"no es un vaults.enc").is_err());
+        paths.write_kdbx("ABC!12", b"kdbx").unwrap();
+        assert_eq!(paths.read_kdbx("ABC!12").unwrap(), b"kdbx");
+        assert!(paths.write_kdbx("../fuera", b"x").is_err(), "el id no puede salir de la carpeta");
         paths.reset().unwrap();
         assert!(!dir.join("config.kpm").exists());
+        assert!(!dir.join("kdbx").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
