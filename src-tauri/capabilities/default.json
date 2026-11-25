@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "description": "Permisos de la ventana principal: solo los comandos propios de la app y los eventos",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

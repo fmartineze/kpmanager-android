@@ -1,0 +1,37 @@
+[package]
+name = "kpmanager-android"
+version = "0.1.0"
+description = "KP Manager para Android: consulta de solo lectura de los vaults de KeePass"
+authors = ["fmartineze"]
+license = "MIT"
+repository = "https://github.com/fmartineze/kpmanager-android"
+edition = "2024"
+
+[lib]
+name = "kpmanager_android_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-deep-link = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["serde"] }
+thiserror = "2"
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
