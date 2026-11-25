@@ -1,12 +1,14 @@
 import { FormEvent, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Account, api, errMsg, Item, LoginEvent, Vault } from "../api";
+import { Account, api, errCode, errMsg, Item, LoginEvent, RestoreInfo, Vault } from "../api";
 import { rich, useT } from "../i18n";
-import { IconBack, IconCheck, IconDatabase, IconFolder, IconKey, IconShield, IconUser } from "./Icons";
+import { IconBack, IconCheck, IconDatabase, IconDownload, IconFolder, IconKey, IconShield, IconUser } from "./Icons";
 import { Alert, Note } from "./ui";
 
-type Step = "welcome" | "microsoft" | "folder" | "data" | "master" | "done";
-const ORDER: Step[] = ["welcome", "microsoft", "folder", "data", "master", "done"];
+type Step = "welcome" | "restore" | "microsoft" | "folder" | "data" | "master" | "done";
+const FRESH: Step[] = ["microsoft", "folder", "data", "master"];
+// Al restaurar, la carpeta y el fichero vienen en la copia: solo se vuelve a elegir si ya no están en OneDrive.
+const RESTORE: Step[] = ["restore", "microsoft", "folder", "data"];
 
 // El registro de Entra ID no es secreto: se recuerda en el navegador para no volver a escribirlo.
 const REG_KEY = "kp.reg";
@@ -19,16 +21,28 @@ function savedReg(): { tenant: string; clientId: string } {
   }
 }
 
-/** Asistente del primer arranque: Microsoft 365 → carpeta → fichero de datos → contraseña maestra. */
+/**
+ * Asistente del primer arranque.
+ * - De cero: Microsoft 365 → carpeta → fichero de datos → contraseña maestra.
+ * - Restaurando una copia de otro móvil: copia + maestra → Microsoft 365 (y listo).
+ */
 export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
   const t = useT();
   const [step, setStep] = useState<Step>("welcome");
   const [error, setError] = useState("");
+  /** Aviso que se mantiene al navegar por carpetas (la copia apuntaba a un fichero que ya no está). */
+  const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
 
   const [reg, setReg] = useState(savedReg);
   const [account, setAccount] = useState<Account | null>(null);
   const [waiting, setWaiting] = useState(false);
+
+  // Copia de seguridad: fichero elegido y, una vez abierta, lo que contiene.
+  const [backupName, setBackupName] = useState<string | null>(null);
+  const [restored, setRestored] = useState<RestoreInfo | null>(null);
+  const restoring = step === "restore" || restored !== null;
+  const path = restoring ? RESTORE : FRESH;
 
   // Navegación de carpetas: pila de carpetas abiertas (la primera es la raíz).
   const [trail, setTrail] = useState<Item[]>([]);
@@ -40,7 +54,7 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
   const [pw, setPw] = useState("");
   const [vaults, setVaults] = useState<Vault[]>([]);
 
-  const idx = ORDER.indexOf(step);
+  const idx = path.indexOf(step);
   const go = (s: Step) => {
     setError("");
     setStep(s);
@@ -59,6 +73,37 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
       un.then((f) => f());
     };
   }, []);
+
+  async function pickBackup() {
+    setError("");
+    try {
+      const name = await api.restorePick();
+      if (name) {
+        setBackupName(name);
+        setRestored(null);
+      }
+    } catch (e) {
+      setError(errMsg(e));
+    }
+  }
+
+  async function openBackup(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const info = await api.restoreOpen(pw);
+      setPw("");
+      setRestored(info);
+      setReg({ tenant: info.tenant, clientId: info.clientId });
+      setAccount(null);
+      go("microsoft");
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function signIn() {
     setError("");
@@ -114,23 +159,42 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
     }
   }
 
-  async function finish(e: FormEvent) {
-    e.preventDefault();
+  /** Descarga y abre el fichero de datos. `password` nulo: la maestra de la copia restaurada. */
+  async function finish(folderId: string, data: string, password: string | null) {
     setBusy(true);
     setError("");
     try {
-      const v = await api.finish(folder.id, dataId, pw);
+      const v = await api.finish(folderId, data, password);
       setPw("");
       setVaults(v);
       go("done");
     } catch (err) {
-      setError(errMsg(err));
+      // La copia apunta a un fichero que ya no está (se movió o es otra cuenta): se elige de nuevo.
+      if (restored && errCode(err) === "itemMissing" && step === "microsoft") {
+        setTrail([]);
+        setNotice(t("wiz.restoreMoved"));
+        go("folder");
+      } else setError(errMsg(err));
     } finally {
       setBusy(false);
     }
   }
 
-  const back = () => go(ORDER[Math.max(0, idx - 1)]);
+  function afterLogin() {
+    if (restored) finish(restored.folder.id, restored.dataFile.id, null);
+    else {
+      setTrail([]);
+      go("folder");
+    }
+  }
+
+  const back = () => {
+    if (idx <= 0) {
+      setRestored(null);
+      setBackupName(null);
+      go("welcome");
+    } else go(path[idx - 1]);
+  };
   const subfolders = items?.filter((i) => i.folder) ?? null;
 
   return (
@@ -140,8 +204,8 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
           <button className="btn btn-icon plain" onClick={back} aria-label={t("common.back")} disabled={busy}>
             <IconBack className="s16" />
           </button>
-          <div className="wiz-progress" aria-label={t("wiz.step", { n: idx, total: ORDER.length - 2 })}>
-            {ORDER.slice(1, -1).map((s, i) => <b key={s} className={i < idx ? "on" : ""} />)}
+          <div className="wiz-progress" aria-label={t("wiz.step", { n: idx + 1, total: path.length })}>
+            {path.map((s, i) => <b key={s} className={i <= idx ? "on" : ""} />)}
           </div>
         </div>
       )}
@@ -153,17 +217,55 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
           <p className="lede">{rich(t("wiz.welcomeLede"))}</p>
           <div className="form">
             <div className="label">{t("wiz.haveBackup")}</div>
-            <button className="btn btn-secondary btn-block" disabled title={t("wiz.restoreSoon")}>{t("wiz.restore")}</button>
-            <div className="help">{t("wiz.restoreSoon")}</div>
-            <button className="btn btn-primary btn-block" onClick={() => go("microsoft")}>{t("wiz.fresh")}</button>
+            <button className="btn btn-secondary btn-block" onClick={() => go("restore")}>{t("wiz.restore")}</button>
+            <button className="btn btn-primary btn-block" onClick={() => { setRestored(null); go("microsoft"); }}>{t("wiz.fresh")}</button>
           </div>
         </div>
+      )}
+
+      {step === "restore" && (
+        <form className="wiz-body" onSubmit={openBackup}>
+          <h2 className="wiz-title"><IconDownload /> {t("wiz.restoreTitle")}</h2>
+          <p className="wiz-lede">{rich(t("wiz.restoreLede"))}</p>
+          {backupName ? (
+            <>
+              <div className="choice-card compact on">
+                <span className="txt"><strong>{backupName}</strong></span>
+              </div>
+              <button type="button" className="btn btn-link suggest" onClick={pickBackup}>{t("wiz.restoreOther")}</button>
+              <div className="field">
+                <div className={`input ${error ? "is-error" : ""}`}>
+                  <IconKey className="s16" />
+                  <input className="input-el" type="password" autoComplete="off" autoFocus placeholder={t("unlock.master")} value={pw} onChange={(e) => setPw(e.target.value)} />
+                </div>
+              </div>
+            </>
+          ) : (
+            <button type="button" className="btn btn-secondary btn-block" onClick={pickBackup}>{t("wiz.restorePick")}</button>
+          )}
+          {error && <Alert kind="err">{error}</Alert>}
+          <div className="grow" />
+          <button className="btn btn-primary btn-block" disabled={busy || !backupName || !pw}>
+            {busy && <span className="spin" />} {busy ? t("wiz.restoreOpening") : t("wiz.restoreOpen")}
+          </button>
+        </form>
       )}
 
       {step === "microsoft" && (
         <div className="wiz-body">
           <h2 className="wiz-title"><IconUser /> {t("wiz.msTitle")}</h2>
-          <p className="wiz-lede">{t("wiz.msLede")}</p>
+          {restored ? (
+            <Alert kind="ok">
+              {rich(t("wiz.restoredInfo", {
+                upn: restored.account.upn,
+                date: new Date(restored.created * 1000).toLocaleDateString(),
+                folder: restored.folder.path || restored.folder.name,
+                n: restored.keys,
+              }))}
+            </Alert>
+          ) : (
+            <p className="wiz-lede">{t("wiz.msLede")}</p>
+          )}
           <div className="field">
             <label className="label" htmlFor="tenant">{t("wiz.tenant")}</label>
             <div className="input">
@@ -181,7 +283,7 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
           {account ? (
             <>
               <Alert kind="ok">{rich(t("wiz.signedAs", { name: account.upn || account.name }))}</Alert>
-              <button className="btn btn-link suggest" onClick={signIn}>{t("wiz.otherAccount")}</button>
+              <button className="btn btn-link suggest" onClick={signIn} disabled={busy}>{t("wiz.otherAccount")}</button>
             </>
           ) : (
             <button className="btn btn-secondary btn-block" onClick={signIn} disabled={!reg.tenant.trim() || !reg.clientId.trim()}>
@@ -190,7 +292,9 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
           )}
           {error && <Alert kind="err">{error}</Alert>}
           <div className="grow" />
-          <button className="btn btn-primary btn-block" disabled={!account} onClick={() => { setTrail([]); go("folder"); }}>{t("common.next")}</button>
+          <button className="btn btn-primary btn-block" disabled={!account || busy} onClick={afterLogin}>
+            {busy && <span className="spin" />} {busy ? t("wiz.opening") : restored ? t("wiz.finish") : t("common.next")}
+          </button>
         </div>
       )}
 
@@ -198,6 +302,7 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
         <div className="wiz-body">
           <h2 className="wiz-title"><IconFolder /> {t("wiz.folderTitle")}</h2>
           <p className="wiz-lede">{t("wiz.folderLede")}</p>
+          {notice && <Alert kind="info">{notice}</Alert>}
           <div className="crumbs">
             {trail.length > 1 && (
               <button className="btn btn-icon plain" onClick={upFolder} aria-label={t("common.back")}><IconBack className="s14" /></button>
@@ -244,12 +349,18 @@ export function Wizard({ onDone }: { onDone: (vaults: Vault[]) => void }) {
           )}
           {error && <Alert kind="err">{error}</Alert>}
           <div className="grow" />
-          <button className="btn btn-primary btn-block" disabled={!dataId} onClick={() => go("master")}>{t("common.next")}</button>
+          {restored ? (
+            <button className="btn btn-primary btn-block" disabled={!dataId || busy} onClick={() => finish(folder.id, dataId, null)}>
+              {busy && <span className="spin" />} {busy ? t("wiz.opening") : t("wiz.finish")}
+            </button>
+          ) : (
+            <button className="btn btn-primary btn-block" disabled={!dataId} onClick={() => go("master")}>{t("common.next")}</button>
+          )}
         </div>
       )}
 
       {step === "master" && (
-        <form className="wiz-body" onSubmit={finish}>
+        <form className="wiz-body" onSubmit={(e) => { e.preventDefault(); finish(folder.id, dataId, pw); }}>
           <h2 className="wiz-title"><IconKey /> {t("wiz.masterTitle")}</h2>
           <p className="wiz-lede">{t("wiz.masterLede")}</p>
           <div className="field">

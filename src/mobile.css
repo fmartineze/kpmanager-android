@@ -6,6 +6,11 @@
   -webkit-tap-highlight-color: transparent;
 }
 .win.mobile > * { position: relative; z-index: 1; }
+/* …salvo las capas que flotan sobre la pantalla: si no, el diálogo crece con su contenido y se corta abajo
+   en vez de desplazarse. */
+.win.mobile > .scrim, .win.mobile > .toasts { position: absolute; }
+.win.mobile > .scrim { z-index: 10; }
+.win.mobile > .toasts { z-index: 30; }
 
 /* Sin barra de título: los diálogos ocupan toda la pantalla útil. */
 .scrim { inset: 0; padding: max(14px, env(safe-area-inset-top)) 12px max(14px, env(safe-area-inset-bottom)); }
@@ -65,3 +70,23 @@
 .kv { display: flex; flex-direction: column; gap: 2px; }
 .kv span { font-size: var(--kp-fs-xs); color: var(--kp-text-3); }
 .kv b { font-size: var(--kp-fs-sm); font-weight: 600; overflow-wrap: anywhere; }
+
+/* Fila de cliente: fichero de clave que falta */
+.row-sub.warn { color: var(--kp-danger); }
+.mono { font-family: var(--kp-font-mono); }
+
+/* Opciones con el detalle debajo (en vez de a la derecha) */
+.choice-card.compact.stacked { align-items: flex-start; padding: 9px 10px; }
+.choice-card.compact.stacked .radio { margin-top: 2px; }
+.choice-card.compact.stacked .txt { flex-direction: column; align-items: stretch; gap: 2px; }
+.choice-card.compact.stacked small { text-align: left; white-space: normal; }
+
+/* Biblioteca de ficheros de clave */
+.keylist { display: flex; flex-direction: column; gap: 8px; }
+.keyrow { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: var(--kp-radius-lg); background: var(--kp-glass); border: 1px solid var(--kp-glass-border); }
+.keyrow-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.keyrow-ic { flex: none; width: 32px; height: 32px; border-radius: var(--kp-radius-md); display: grid; place-items: center; background: var(--kp-accent-soft); color: var(--kp-accent-text); }
+.keyrow .btns { display: flex; gap: 4px; flex-wrap: wrap; margin-left: 34px; }
+.keyrow-confirm { display: flex; flex-direction: column; gap: 6px; margin-left: 42px; font-size: var(--kp-fs-sm); color: var(--kp-text-2); }
+.btn-ghost.danger { color: var(--kp-danger); }
+.modal-foot .btn-block { flex: 1; }

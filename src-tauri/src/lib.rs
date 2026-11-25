@@ -5,8 +5,10 @@
 
 mod config;
 mod crypto;
+mod docs;
 mod error;
 mod graph;
+mod library;
 mod model;
 
 use serde::Serialize;
@@ -16,10 +18,11 @@ use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_opener::OpenerExt;
 use zeroize::Zeroizing;
 
-use config::{Config, Paths};
+use config::{Backup, Config, Paths};
 use crypto::Keys;
 use error::{AppError, Result};
 use graph::{Account, AppReg, Item, PendingLogin, Tokens};
+use library::{KeyState, KeyView, Library};
 use model::Data;
 
 /// Lo que la interfaz ve de cada vault: sin contraseñas ni rutas completas.
@@ -34,6 +37,8 @@ struct VaultView {
     file: String,
     /// Nombre del fichero de clave que usa en Windows, si usa uno.
     keyfile: Option<String>,
+    /// Fichero de clave de la biblioteca de este móvil que le corresponde.
+    key: KeyState,
 }
 
 fn file_name(windows_path: &str) -> String {
@@ -51,10 +56,18 @@ fn views(data: &Data) -> Vec<VaultView> {
             favorite: v.favorite,
             file: file_name(&v.path),
             keyfile: v.keyfile.as_deref().map(file_name),
+            key: KeyState::default(),
         })
         .collect();
     v.sort_by(|a, b| b.favorite.cmp(&a.favorite).then_with(|| a.client.to_lowercase().cmp(&b.client.to_lowercase())));
     v
+}
+
+/// Añade a cada vault la clave de la biblioteca que le toca.
+fn with_keys(base: &[VaultView], lib: &Library) -> Vec<VaultView> {
+    base.iter()
+        .map(|v| VaultView { key: lib.resolve(&v.id, v.keyfile.as_deref()), ..v.clone() })
+        .collect()
 }
 
 /// Descifra el fichero de datos con la maestra y devuelve la lista (y la clave, para próximas descargas).
@@ -74,6 +87,10 @@ struct Wizard {
     reg: Option<AppReg>,
     account: Option<Account>,
     tokens: Option<Tokens>,
+    /// Copia de seguridad elegida, aún sin abrir.
+    restore_blob: Option<Vec<u8>>,
+    /// Copia abierta: la maestra se guarda en memoria hasta terminar el asistente (no se pide dos veces).
+    restore: Option<(Backup, Zeroizing<String>)>,
 }
 
 /// App desbloqueada.
@@ -83,6 +100,16 @@ struct Session {
     data_keys: Keys,
     vaults: Vec<VaultView>,
     tokens: Option<Tokens>,
+}
+
+impl Session {
+    fn vaults(&self) -> Vec<VaultView> {
+        with_keys(&self.vaults, &self.config.library)
+    }
+
+    fn save(&self, paths: &Paths) -> Result<()> {
+        paths.save(&self.cfg_keys, &self.config)
+    }
 }
 
 #[derive(Default)]
@@ -164,7 +191,10 @@ async fn finish_login(app: AppHandle, url: url::Url) {
             state.paths.save(&s.cfg_keys, &s.config)?;
             s.tokens = Some(tokens);
         } else {
-            inner.wizard = Wizard { reg: Some(pending.reg), account: Some(account.clone()), tokens: Some(tokens) };
+            let w = &mut inner.wizard;
+            w.reg = Some(pending.reg);
+            w.account = Some(account.clone());
+            w.tokens = Some(tokens);
         }
         Ok(account)
     }
@@ -196,10 +226,18 @@ async fn wizard_find(state: State<'_, AppState>, folder_id: String) -> Result<Ve
 }
 
 /// Último paso del asistente: descarga el fichero de datos, lo abre con la maestra y guarda la configuración.
+/// Al restaurar una copia, la maestra ya se escribió al abrirla y `password` llega vacío.
 #[tauri::command]
-async fn wizard_finish(state: State<'_, AppState>, folder_id: String, data_id: String, password: String) -> Result<Vec<VaultView>> {
-    let password = Zeroizing::new(password);
-    let token = wizard_token(&*state.inner.lock().await)?;
+async fn wizard_finish(state: State<'_, AppState>, folder_id: String, data_id: String, password: Option<String>) -> Result<Vec<VaultView>> {
+    let (token, password) = {
+        let inner = state.inner.lock().await;
+        let password = match (password, &inner.wizard.restore) {
+            (Some(p), _) => Zeroizing::new(p),
+            (None, Some((_, p))) => p.clone(),
+            (None, None) => return Err(AppError::WrongPassword),
+        };
+        (wizard_token(&inner)?, password)
+    };
     let folder = graph::item(&state.http, &token, &folder_id).await?;
     let data_file = graph::item(&state.http, &token, &data_id).await?;
     let blob = graph::download(&state.http, &token, &data_id).await?;
@@ -220,6 +258,7 @@ async fn wizard_finish(state: State<'_, AppState>, folder_id: String, data_id: S
     let (Some(reg), Some(account), Some(tokens)) = (w.reg, w.account, w.tokens) else {
         return Err(AppError::msg("loginExpired"));
     };
+    let library = w.restore.map(|(b, _)| b.library).unwrap_or_default();
     let config = Config {
         version: 1,
         reg,
@@ -228,11 +267,63 @@ async fn wizard_finish(state: State<'_, AppState>, folder_id: String, data_id: S
         data_file,
         refresh_token: tokens.refresh.clone(),
         synced_at: Some(config::now()),
+        library,
     };
     state.paths.write_data(&blob)?;
     state.paths.save(&cfg_keys, &config)?;
-    inner.session = Some(Session { cfg_keys, config, data_keys, vaults: vaults.clone(), tokens: Some(tokens) });
-    Ok(vaults)
+    let s = Session { cfg_keys, config, data_keys, vaults, tokens: Some(tokens) };
+    let out = s.vaults();
+    inner.session = Some(s);
+    Ok(out)
+}
+
+/// Lo que se enseña de una copia de seguridad abierta.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreInfo {
+    tenant: String,
+    client_id: String,
+    account: Account,
+    folder: Item,
+    data_file: Item,
+    keys: usize,
+    created: u64,
+}
+
+/// Asistente → «Restaurar copia»: el usuario elige el fichero `.kpmbak`.
+#[tauri::command]
+async fn wizard_restore_pick(app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>> {
+    let Some(doc) = blocking(move || docs::open(&app, config::MAX_BACKUP_BYTES)).await? else {
+        return Ok(None);
+    };
+    if !Keys::looks_valid(&doc.data) {
+        return Err(AppError::msg("notBackup"));
+    }
+    let mut inner = state.inner.lock().await;
+    inner.wizard.restore = None;
+    inner.wizard.restore_blob = Some(doc.data.to_vec());
+    Ok(Some(doc.name))
+}
+
+/// Abre la copia elegida con la maestra.
+#[tauri::command]
+async fn wizard_restore_open(state: State<'_, AppState>, password: String) -> Result<RestoreInfo> {
+    let password = Zeroizing::new(password);
+    let blob = state.inner.lock().await.wizard.restore_blob.clone().ok_or_else(|| AppError::msg("notBackup"))?;
+    let (backup, password) = blocking(move || Ok((Backup::open(&password, &blob)?, password))).await?;
+    let info = RestoreInfo {
+        tenant: backup.reg.tenant.clone(),
+        client_id: backup.reg.client_id.clone(),
+        account: backup.account.clone(),
+        folder: backup.folder.clone(),
+        data_file: backup.data_file.clone(),
+        keys: backup.library.keys.len(),
+        created: backup.created,
+    };
+    let mut inner = state.inner.lock().await;
+    inner.wizard.restore_blob = None;
+    inner.wizard.restore = Some((backup, password));
+    Ok(info)
 }
 
 /// Desbloquea con la maestra usando la copia local (funciona sin conexión).
@@ -251,8 +342,10 @@ async fn unlock(state: State<'_, AppState>, password: String) -> Result<Vec<Vaul
         Ok((cfg_keys, config, data_keys, vaults))
     })
     .await?;
-    state.inner.lock().await.session = Some(Session { cfg_keys, config, data_keys, vaults: vaults.clone(), tokens: None });
-    Ok(vaults)
+    let s = Session { cfg_keys, config, data_keys, vaults, tokens: None };
+    let out = s.vaults();
+    state.inner.lock().await.session = Some(s);
+    Ok(out)
 }
 
 #[derive(Serialize)]
@@ -335,8 +428,95 @@ async fn sync(state: State<'_, AppState>) -> Result<SyncResult> {
     };
     s.config.data_file = meta;
     s.config.synced_at = Some(config::now());
-    state.paths.save(&s.cfg_keys, &s.config)?;
-    Ok(SyncResult { changed, vaults: s.vaults.clone(), synced_at: s.config.synced_at })
+    s.save(&state.paths)?;
+    Ok(SyncResult { changed, vaults: s.vaults(), synced_at: s.config.synced_at })
+}
+
+// ── Biblioteca de ficheros de clave ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryOut {
+    /// Nombre del fichero recién importado (al importar).
+    added: Option<String>,
+    keys: Vec<KeyView>,
+    vaults: Vec<VaultView>,
+}
+
+fn library_out(s: &Session, added: Option<String>) -> LibraryOut {
+    let vaults = s.vaults();
+    let mut uses = std::collections::BTreeMap::new();
+    for id in vaults.iter().filter_map(|v| v.key.id.clone()) {
+        *uses.entry(id).or_insert(0) += 1;
+    }
+    LibraryOut { added, keys: s.config.library.views(&uses), vaults }
+}
+
+/// Cambia la biblioteca, la guarda cifrada y devuelve el nuevo estado.
+async fn edit_library(state: &AppState, added: Option<String>, f: impl FnOnce(&mut Library) -> Result<()>) -> Result<LibraryOut> {
+    let mut inner = state.inner.lock().await;
+    let s = inner.session.as_mut().ok_or(AppError::Locked)?;
+    let mut lib = s.config.library.clone();
+    f(&mut lib)?;
+    s.config.library = lib;
+    s.save(&state.paths)?;
+    Ok(library_out(s, added))
+}
+
+#[tauri::command]
+async fn keys(state: State<'_, AppState>) -> Result<LibraryOut> {
+    let inner = state.inner.lock().await;
+    Ok(library_out(inner.session.as_ref().ok_or(AppError::Locked)?, None))
+}
+
+/// Importa un fichero de clave elegido con el selector del sistema.
+#[tauri::command]
+async fn key_import(app: AppHandle, state: State<'_, AppState>) -> Result<LibraryOut> {
+    if state.inner.lock().await.session.is_none() {
+        return Err(AppError::Locked);
+    }
+    let Some(doc) = blocking(move || docs::open(&app, library::MAX_KEY_BYTES)).await? else {
+        return keys(state).await;
+    };
+    let name = doc.name.clone();
+    edit_library(&state, Some(name.clone()), |lib| lib.add(&name, &doc.data, config::now()).map(|_| ())).await
+}
+
+#[tauri::command]
+async fn key_delete(state: State<'_, AppState>, id: String) -> Result<LibraryOut> {
+    edit_library(&state, None, |lib| lib.remove(&id)).await
+}
+
+#[tauri::command]
+async fn key_default(state: State<'_, AppState>, id: Option<String>) -> Result<LibraryOut> {
+    edit_library(&state, None, |lib| lib.set_default(id.as_deref())).await
+}
+
+/// `choice`: `auto`, `none` o el id de una clave de la biblioteca.
+#[tauri::command]
+async fn vault_key(state: State<'_, AppState>, vault_id: String, choice: String) -> Result<LibraryOut> {
+    {
+        let inner = state.inner.lock().await;
+        let s = inner.session.as_ref().ok_or(AppError::Locked)?;
+        if !s.vaults.iter().any(|v| v.id == vault_id) {
+            return Err(AppError::msg("vaultUnknown"));
+        }
+    }
+    edit_library(&state, None, |lib| lib.assign(&vault_id, &choice)).await
+}
+
+// ── Copia de seguridad ───────────────────────────────────────────────────────────────────────────
+
+/// Guarda la copia de seguridad donde elija el usuario. Devuelve el nombre, o nada si canceló.
+#[tauri::command]
+async fn backup_save(app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>> {
+    let blob = {
+        let inner = state.inner.lock().await;
+        let s = inner.session.as_ref().ok_or(AppError::Locked)?;
+        s.config.backup(&s.cfg_keys)?
+    };
+    let name = config::backup_name(config::now());
+    blocking(move || docs::save(&app, &name, "application/octet-stream", &blob)).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -344,6 +524,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(docs::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             app.manage(AppState {
@@ -373,9 +554,17 @@ pub fn run() {
             wizard_children,
             wizard_find,
             wizard_finish,
+            wizard_restore_pick,
+            wizard_restore_open,
             unlock,
             info,
             sync,
+            keys,
+            key_import,
+            key_delete,
+            key_default,
+            vault_key,
+            backup_save,
         ])
         .run(tauri::generate_context!())
         .expect("error al arrancar KP Manager");

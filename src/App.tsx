@@ -1,12 +1,13 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, errMsg, Info, isNetwork, LoginEvent, Status, Vault } from "./api";
+import { api, errMsg, Info, isNetwork, KeyFile, KeyState, Library, LoginEvent, pickerOpen, Status, Vault } from "./api";
 import { rich, useT } from "./i18n";
 import { setThemePref, ThemePref } from "./theme";
 import { Wizard } from "./components/Wizard";
+import { KeysModal, VaultSheet } from "./components/Keys";
 import { Modal } from "./components/Modal";
 import { Alert, Note, Segmented } from "./components/ui";
-import { IconAlert, IconCheck, IconKey, IconLock, IconRefresh, IconSearch, IconSettings, IconShield, IconStar, IconX } from "./components/Icons";
+import { IconAlert, IconCheck, IconDownload, IconKey, IconLock, IconRefresh, IconSearch, IconSettings, IconShield, IconStar, IconX } from "./components/Icons";
 
 type Phase = "loading" | "wizard" | "locked" | "ready";
 type Toast = { msg: string; kind: "ok" | "error"; key: number } | null;
@@ -17,6 +18,16 @@ const AUTO_LOCK_MS = 3 * 60 * 1000;
 const initial = (s: string) => (s.trim()[0] ?? "?").toUpperCase();
 const hue = (s: string) => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % 6;
 const norm = (s: string) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+
+/** Qué fichero de clave tocaría en automático (misma regla que en Rust), para explicarlo en la ficha. */
+function autoKey(v: Vault, keys: KeyFile[]): KeyState {
+  if (v.key.mode === "auto") return v.key;
+  const none: KeyState = { mode: "auto", id: null, name: null, by: null, missing: false };
+  if (!v.keyfile) return none;
+  const byName = keys.find((k) => k.name.toLowerCase() === v.keyfile!.toLowerCase());
+  const k = byName ?? keys.find((x) => x.isDefault);
+  return k ? { ...none, id: k.id, name: k.name, by: byName ? "name" : "default" } : { ...none, missing: true };
+}
 
 function Unlock({ onUnlocked }: { onUnlocked: (v: Vault[]) => void }) {
   const t = useT();
@@ -61,10 +72,18 @@ function Unlock({ onUnlocked }: { onUnlocked: (v: Vault[]) => void }) {
   );
 }
 
-function Settings({ version, onClose, onReset, toast }: { version: string; onClose: () => void; onReset: () => void; toast: (m: string, k?: "ok" | "error") => void }) {
+function Settings({ version, keyCount, onClose, onReset, onKeys, toast }: {
+  version: string;
+  keyCount: number;
+  onClose: () => void;
+  onReset: () => void;
+  onKeys: () => void;
+  toast: (m: string, k?: "ok" | "error") => void;
+}) {
   const t = useT();
   const [info, setInfo] = useState<Info | null>(null);
   const [confirm, setConfirm] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [theme, setTheme] = useState<ThemePref>(() => {
     try {
       const v = localStorage.getItem("kp.theme");
@@ -90,6 +109,18 @@ function Settings({ version, onClose, onReset, toast }: { version: string; onClo
 
   const when = info?.syncedAt ? new Date(info.syncedAt * 1000).toLocaleString() : t("set.never");
 
+  async function backup() {
+    setSaving(true);
+    try {
+      const name = await api.backupSave();
+      if (name) toast(t("set.backupSaved", { name }));
+    } catch (e) {
+      toast(errMsg(e), "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <Modal title={t("set.title")} icon={<IconSettings className="s16" />} onClose={onClose}>
       <div className="section">
@@ -99,6 +130,22 @@ function Settings({ version, onClose, onReset, toast }: { version: string; onClo
         <div className="kv"><span>{t("set.synced")}</span><b>{when}</b></div>
         <div className="btns">
           <button className="btn btn-secondary btn-sm" onClick={() => api.login().catch((e) => toast(errMsg(e), "error"))}>{t("set.relogin")}</button>
+        </div>
+      </div>
+      <div className="section">
+        <div className="section-title">{t("set.keys")}</div>
+        <div className="kv"><span>{t("set.keysHere")}</span><b>{keyCount}</b></div>
+        <div className="btns">
+          <button className="btn btn-secondary btn-sm" onClick={onKeys}><IconKey className="s14" /> {t("set.keysManage")}</button>
+        </div>
+      </div>
+      <div className="section">
+        <div className="section-title">{t("set.backup")}</div>
+        <Note>{t("set.backupHelp")}</Note>
+        <div className="btns">
+          <button className="btn btn-secondary btn-sm" onClick={backup} disabled={saving}>
+            {saving ? <span className="spin" /> : <IconDownload className="s14" />} {t("set.backupSave")}
+          </button>
         </div>
       </div>
       <div className="section">
@@ -147,6 +194,9 @@ export default function App() {
   const [settings, setSettings] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [keys, setKeys] = useState<KeyFile[]>([]);
+  const [keysOpen, setKeysOpen] = useState(false);
+  const [libBusy, setLibBusy] = useState(false);
   const toastTimer = useRef<number>(0);
 
   const showToast = useCallback((msg: string, kind: "ok" | "error" = "ok") => {
@@ -172,13 +222,16 @@ export default function App() {
     setTag(null);
     setSettings(false);
     setSelected(null);
+    setKeys([]);
+    setKeysOpen(false);
     setPhase((p) => (p === "ready" ? "locked" : p));
   }, []);
 
   // Al pasar a segundo plano se bloquea (y se descarta la lista). Durante el asistente no: hay que ir al navegador.
   useEffect(() => {
     if (phase !== "ready") return;
-    const onHide = () => document.visibilityState === "hidden" && lock();
+    // Excepto con el selector de ficheros abierto: también pasa la app a segundo plano.
+    const onHide = () => document.visibilityState === "hidden" && !pickerOpen() && lock();
     document.addEventListener("visibilitychange", onHide);
     let timer = window.setTimeout(lock, AUTO_LOCK_MS);
     const reset = () => {
@@ -213,9 +266,35 @@ export default function App() {
     [showToast, t],
   );
 
+  const applyLib = (l: Library) => {
+    setKeys(l.keys);
+    setVaults(l.vaults);
+  };
+
+  // Acciones sobre la biblioteca: todas devuelven la biblioteca y la lista actualizadas.
+  const libAction = useCallback(
+    async (f: () => Promise<Library>, ok?: (l: Library) => string | null) => {
+      setLibBusy(true);
+      try {
+        const l = await f();
+        setKeys(l.keys);
+        setVaults(l.vaults);
+        const msg = ok?.(l);
+        if (msg) showToast(msg);
+      } catch (e) {
+        showToast(errMsg(e), "error");
+      } finally {
+        setLibBusy(false);
+      }
+    },
+    [showToast],
+  );
+  const importKey = () => libAction(api.keyImport, (l) => (l.added ? t("keys.added", { name: l.added }) : null));
+
   const unlocked = (v: Vault[]) => {
     setVaults(v);
     setPhase("ready");
+    api.keys().then(applyLib).catch(() => {});
     // Busca cambios en OneDrive en segundo plano; la lista ya se ve con la copia local.
     sync(false);
   };
@@ -234,6 +313,7 @@ export default function App() {
     (v) => (!q || norm(v.client).includes(q) || norm(v.file).includes(q)) && (!tag || v.tags.some((x) => x.toLowerCase() === tag.toLowerCase())),
   );
   const filtering = !!q || !!tag;
+  const selectedVault = vaults.find((v) => v.id === selected) ?? null;
 
   let body;
   if (phase === "loading") body = <div className="empty"><span className="spin lg" /></div>;
@@ -289,11 +369,15 @@ export default function App() {
             {filtered.map((v, i) => (
               <div key={v.id} className={`row tall ${selected === v.id ? "is-focus" : ""}`}
                 style={{ animation: "kp-fade-up var(--kp-dur-base) var(--kp-ease-out) backwards", animationDelay: `${Math.min(i, 12) * 22}ms` }}>
-                <button className="row-main" onClick={() => setSelected(selected === v.id ? null : v.id)}>
+                <button className="row-main" onClick={() => setSelected(v.id)}>
                   <span className={`avatar av-${hue(v.client)}`}>{initial(v.client)}</span>
                   <span className="row-text">
                     <span className="row-name">{v.client}</span>
-                    <span className="row-sub">{v.file}{v.keyfile ? ` · ${t("list.keyfile", { name: v.keyfile })}` : ""}</span>
+                    {v.key.missing ? (
+                      <span className="row-sub warn">{t("list.keyMissing", { name: v.keyfile ?? "" })}</span>
+                    ) : (
+                      <span className="row-sub">{v.file}{v.key.name ? ` · ${t("list.keyfile", { name: v.key.name })}` : ""}</span>
+                    )}
                   </span>
                   {v.tags.length > 0 && (
                     <span className="row-tags">
@@ -305,13 +389,38 @@ export default function App() {
                 </button>
               </div>
             ))}
-            {selected && <Note>{t("list.soon")}</Note>}
           </div>
+        )}
+        {selectedVault && (
+          <VaultSheet
+            vault={selectedVault}
+            keys={keys}
+            auto={autoKey(selectedVault, keys)}
+            busy={libBusy}
+            onClose={() => setSelected(null)}
+            onChoose={(choice) => libAction(() => api.vaultKey(selectedVault.id, choice))}
+            onImport={importKey}
+          />
+        )}
+        {keysOpen && (
+          <KeysModal
+            keys={keys}
+            busy={libBusy}
+            onClose={() => setKeysOpen(false)}
+            onImport={importKey}
+            onDefault={(id) => libAction(() => api.keyDefault(id))}
+            onDelete={(id) => libAction(() => api.keyDelete(id), () => t("keys.deleted"))}
+          />
         )}
         {settings && status && (
           <Settings
             version={status.version}
+            keyCount={keys.length}
             toast={showToast}
+            onKeys={() => {
+              setSettings(false);
+              setKeysOpen(true);
+            }}
             onClose={() => setSettings(false)}
             onReset={async () => {
               await api.reset().catch(() => {});

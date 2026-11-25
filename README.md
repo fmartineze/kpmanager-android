@@ -4,8 +4,8 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
 [KP Manager para Windows](https://github.com/fmartineze/kpmanager). Lee el mismo fichero de datos
 (`vaults.enc`) desde **OneDrive de Microsoft 365** y nunca lo modifica.
 
-> Estado: primera versión de prueba (0.1). Abrir y navegar los vaults, la biblioteca de ficheros de clave,
-> la copia de seguridad y el desbloqueo con huella llegarán en las próximas versiones.
+> Estado: versión de prueba (0.2). Abrir y navegar los vaults y el desbloqueo con huella llegarán en las
+> próximas versiones.
 
 ## Qué hace esta versión
 
@@ -14,6 +14,16 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
   2. elegir la carpeta de OneDrive;
   3. localizar `vaults.enc`;
   4. escribir la contraseña maestra.
+
+  O bien **restaurar una copia de seguridad** de otro móvil: se elige el fichero, se escribe la maestra y se
+  inicia sesión con Microsoft.
+- **Biblioteca de ficheros de clave**, solo en el móvil (no se sincronizan):
+  - se importan con el selector de ficheros de Android;
+  - cada vault usa automáticamente el fichero que se llama igual que en Windows o, si no hay ninguno, el
+    predeterminado;
+  - en la ficha de cada cliente se puede elegir otro o ninguno.
+- **Copia de seguridad** (Ajustes): cuenta, carpeta, fichero de datos y ficheros de clave, en un fichero
+  `.kpmbak` cifrado con la contraseña maestra.
 - Lista de clientes con búsqueda, etiquetas y favoritos, igual que en Windows.
 - Sincronización con OneDrive. Solo descarga el fichero si cambió y, sin conexión, usa la última copia guardada.
 - Se bloquea al pasar a segundo plano y tras 3 minutos sin uso.
@@ -30,6 +40,12 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
   la app).
 - **Tokens:** los tokens y las contraseñas de los vaults no salen de la parte nativa (Rust). La interfaz solo
   recibe nombres de clientes, de ficheros y de carpetas.
+- **Ficheros de clave:** se guardan dentro de la configuración cifrada. Se leen con el selector del sistema
+  directamente desde Rust (plugin propio `DocsPlugin`, que la interfaz web no puede llamar): su contenido nunca
+  pasa por el WebView. La app no pide permisos de almacenamiento; solo accede al fichero que eliges.
+- **Copia de seguridad:** cifrada con la maestra (Argon2id + XChaCha20-Poly1305). No incluye el token de
+  Microsoft: en el móvil nuevo hay que volver a iniciar sesión. Guárdala en un sitio de confianza: con la
+  maestra da acceso a tus ficheros de clave.
 - **Capturas:** `FLAG_SECURE` impide que la app salga en capturas, grabaciones de pantalla y en la vista de
   apps recientes.
 - **Copia automática de Android desactivada** (`allowBackup=false`).
