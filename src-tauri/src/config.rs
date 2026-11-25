@@ -6,12 +6,14 @@
 //!   sin conexión.
 //! - `bio.bin`: la maestra cifrada con una clave del almacén de Android que exige huella (si se activó).
 //! - `kdbx/<id>.kdbx`: copia de los vaults ya abiertos en el móvil, tal cual (los cifra KeePass), para abrirlos
-//!   sin conexión. Solo se descargan de nuevo si cambiaron en OneDrive.
+//!   sin conexión. Solo se descargan de nuevo si cambiaron en OneDrive. Se borran solas si no se abren en
+//!   `cache_days` días o si el vault ya no está en el fichero de datos, y se pueden borrar desde Ajustes.
 //!
 //! La copia de seguridad (`.kpmbak`) lleva lo mismo que `config.kpm` salvo el token de Microsoft, cifrada con
 //! la contraseña maestra: sirve para configurar otro móvil sin repetir el asistente.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -36,7 +38,62 @@ pub struct Config {
     pub library: Library,
     /// Dónde está en OneDrive el `.kdbx` de cada vault (id del vault → elemento, con el eTag de la copia local).
     #[serde(default)]
-    pub vault_files: std::collections::BTreeMap<String, Item>,
+    pub vault_files: BTreeMap<String, Item>,
+    /// Última vez (segundos Unix) que se abrió cada vault en el móvil, para la caducidad de las copias.
+    #[serde(default)]
+    pub vault_used: BTreeMap<String, u64>,
+    /// Días sin abrir tras los que se borra la copia local de un vault (0 = nunca).
+    #[serde(default = "default_cache_days")]
+    pub cache_days: u32,
+}
+
+fn default_cache_days() -> u32 {
+    DEFAULT_CACHE_DAYS
+}
+
+pub const DEFAULT_CACHE_DAYS: u32 = 30;
+
+impl Config {
+    /// Limpia las copias locales de vaults. Borra:
+    /// - las de vaults que ya no están en el fichero de datos (`live`), y olvida su ubicación;
+    /// - las que llevan más de `cache_days` sin abrirse (se conserva la ubicación, para descargarla rápido);
+    /// - los ficheros sueltos que no corresponden a ningún vault.
+    ///
+    /// Las copias sin fecha (de versiones anteriores) empiezan a contar ahora. Devuelve si cambió la configuración.
+    pub fn prune_cache(&mut self, live: &std::collections::HashSet<&str>, paths: &Paths, now: u64) -> bool {
+        let mut changed = false;
+        let gone: Vec<String> = self.vault_files.keys().filter(|k| !live.contains(k.as_str())).cloned().collect();
+        for id in gone {
+            if let Some(item) = self.vault_files.remove(&id) {
+                paths.remove_kdbx(&item.id);
+            }
+            changed = true;
+        }
+        let before = self.vault_used.len();
+        self.vault_used.retain(|k, _| live.contains(k.as_str()));
+        changed |= self.vault_used.len() != before;
+        for id in self.vault_files.keys() {
+            if !self.vault_used.contains_key(id) {
+                self.vault_used.insert(id.clone(), now);
+                changed = true;
+            }
+        }
+        if self.cache_days > 0 {
+            let limit = u64::from(self.cache_days) * 86_400;
+            for (vid, item) in &self.vault_files {
+                if now.saturating_sub(self.vault_used.get(vid).copied().unwrap_or(now)) > limit {
+                    paths.remove_kdbx(&item.id);
+                }
+            }
+        }
+        let keep: std::collections::HashSet<&str> = self.vault_files.values().map(|i| i.id.as_str()).collect();
+        for (id, _) in paths.list_kdbx() {
+            if !keep.contains(id.as_str()) {
+                paths.remove_kdbx(&id);
+            }
+        }
+        changed
+    }
 }
 
 const BACKUP_KIND: &str = "kpmanager-android-backup";
@@ -156,6 +213,27 @@ impl Paths {
         }
     }
 
+    /// Copias locales de vaults: (id de OneDrive, bytes).
+    pub fn list_kdbx(&self) -> Vec<(String, u64)> {
+        let Ok(dir) = std::fs::read_dir(self.kdbx_dir()) else { return Vec::new() };
+        dir.filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let id = name.strip_suffix(".kdbx")?.to_owned();
+                Some((id, e.metadata().ok()?.len()))
+            })
+            .collect()
+    }
+
+    /// Borra todas las copias locales de vaults (Ajustes → Eliminar vaults guardados).
+    pub fn clear_kdbx(&self) -> Result<()> {
+        match std::fs::remove_dir_all(self.kdbx_dir()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn bio(&self) -> PathBuf {
         self.dir.join("bio.bin")
     }
@@ -210,11 +288,7 @@ impl Paths {
 
     /// Borra todo lo de este teléfono (Ajustes → Restablecer).
     pub fn reset(&self) -> Result<()> {
-        match std::fs::remove_dir_all(self.kdbx_dir()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        self.clear_kdbx()?;
         for p in [self.config(), self.data(), self.bio()] {
             match std::fs::remove_file(&p) {
                 Ok(()) => {}
@@ -256,7 +330,52 @@ mod tests {
             synced_at: None,
             library: Library::default(),
             vault_files: Default::default(),
+            vault_used: Default::default(),
+            cache_days: DEFAULT_CACHE_DAYS,
         }
+    }
+
+    fn item(id: &str) -> Item {
+        Item { id: id.into(), name: format!("{id}.kdbx"), folder: false, path: String::new(), etag: String::new() }
+    }
+
+    #[test]
+    fn cache_is_pruned_by_age_and_by_vaults_that_are_gone() {
+        let dir = std::env::temp_dir().join(format!("kpm-android-cache-{}", std::process::id()));
+        let paths = Paths::new(dir.clone());
+        let mut c = sample();
+        for (vault, id) in [("v1", "A1"), ("v2", "B2"), ("v3", "C3")] {
+            paths.write_kdbx(id, b"kdbx").unwrap();
+            c.vault_files.insert(vault.into(), item(id));
+        }
+        paths.write_kdbx("SUELTO", b"kdbx").unwrap();
+        let day = 86_400;
+        let now = 100 * day;
+        c.vault_used.insert("v1".into(), now - 5 * day);
+        c.vault_used.insert("v2".into(), now - 40 * day);
+        // v3 no tiene fecha (copia de una versión anterior): empieza a contar ahora.
+        let live: std::collections::HashSet<&str> = ["v1", "v2", "v3"].into();
+        assert!(c.prune_cache(&live, &paths, now));
+        let mut left: Vec<String> = paths.list_kdbx().into_iter().map(|(id, _)| id).collect();
+        left.sort();
+        assert_eq!(left, ["A1", "C3"], "caduca la de 40 días y la suelta; v3 se conserva");
+        assert!(c.vault_files.contains_key("v2"), "se recuerda dónde está para volver a descargarla");
+        assert_eq!(c.vault_used.get("v3"), Some(&now));
+
+        // Un vault que desaparece del fichero de datos se olvida del todo.
+        let live: std::collections::HashSet<&str> = ["v3"].into();
+        assert!(c.prune_cache(&live, &paths, now));
+        assert!(!c.vault_files.contains_key("v1") && !c.vault_used.contains_key("v1"));
+        assert_eq!(paths.list_kdbx().len(), 1);
+
+        // Sin caducidad no se borra por antigüedad.
+        c.cache_days = 0;
+        assert!(!c.prune_cache(&live, &paths, now + 1000 * day));
+        assert_eq!(paths.list_kdbx().len(), 1);
+
+        paths.clear_kdbx().unwrap();
+        assert!(paths.list_kdbx().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

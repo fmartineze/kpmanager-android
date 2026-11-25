@@ -61,6 +61,14 @@ export interface BioStatus {
   enabled: boolean;
 }
 
+/** Copias de vaults guardadas en el móvil para abrirlos sin conexión. */
+export interface CacheInfo {
+  count: number;
+  bytes: number;
+  /** Días sin abrir tras los que se borra una copia (0 = nunca). */
+  days: number;
+}
+
 export interface Library {
   added: string | null;
   keys: KeyFile[];
@@ -207,6 +215,12 @@ export const api = {
   copySecret: (vaultId: string, entry: string, field: string) => invoke<void>("copy_secret", { vaultId, entry, field }),
   saveAttachment: (vaultId: string, entry: string, name: string) => withPicker(() => invoke<string | null>("save_attachment", { vaultId, entry, name })),
   openLink: (url: string) => invoke<void>("open_link", { url }),
+  /** Menú Compartir de Android con la entrada en texto (lo construye Rust). */
+  shareEntry: (vaultId: string, entry: string, includeCustom: boolean, includeNotes: boolean, lang: string, title: string) =>
+    invoke<void>("share_entry", { vaultId, entry, includeCustom, includeNotes, lang, title }),
+  cacheInfo: () => invoke<CacheInfo>("cache_info"),
+  cacheClear: () => invoke<CacheInfo>("cache_clear"),
+  setCacheDays: (days: number) => invoke<CacheInfo>("set_cache_days", { days }),
   bioStatus: () => invoke<BioStatus>("bio_status"),
   /** Pide la huella para guardar la maestra cifrada. `false` si se canceló. */
   bioEnable: (password: string, title: string, cancel: string) => invoke<boolean>("bio_enable", { password, title, cancel }),

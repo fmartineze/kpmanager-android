@@ -4,7 +4,7 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
 [KP Manager para Windows](https://github.com/fmartineze/kpmanager). Lee el mismo fichero de datos
 (`vaults.enc`) desde **OneDrive de Microsoft 365** y nunca lo modifica.
 
-> Estado: versión de prueba (0.3).
+> Estado: versión de prueba (0.4).
 
 ## Qué hace esta versión
 
@@ -24,7 +24,12 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
 - **Navegar los vaults en solo lectura** (tocar un cliente):
   - grupos, búsqueda, ficha de cada entrada, código TOTP, notas en Markdown y adjuntos;
   - el `.kdbx` se localiza en OneDrive a partir de su ruta de Windows y se guarda una copia en el móvil para
-    abrirlo sin conexión (solo se vuelve a descargar si cambió).
+    abrirlo sin conexión (solo se vuelve a descargar si cambió). Las copias se borran solas si no se abren
+    en 30 días (7, 30, 90 o nunca, en Ajustes) o si el cliente desaparece del fichero de datos, y se pueden
+    eliminar en Ajustes → Copias sin conexión.
+- **Compartir una entrada** con cualquier app (WhatsApp, Telegram, correo…): título, usuario, contraseña y
+  dirección, y si quieres campos personalizados y notas. Nunca el código TOTP ni su semilla. El texto lo
+  construye Rust y va directo al menú Compartir de Android, sin pasar por la interfaz.
 - **Desbloqueo con huella** (Ajustes).
 - **Copia de seguridad** (Ajustes): cuenta, carpeta, fichero de datos y ficheros de clave, en un fichero
   `.kpmbak` cifrado con la contraseña maestra.
@@ -97,8 +102,21 @@ npx tauri android build --apk --target aarch64
 
 El APK queda en `src-tauri/gen/android/app/build/outputs/apk/`.
 
-> Las versiones de prueba se firman con la clave de depuración del equipo que compila. Antes de distribuirla
-> de verdad hay que crear un keystore propio. Al cambiar de clave hay que desinstalar la versión anterior.
+### Firma
+
+Las versiones publicadas se firman con una clave propia que **no está en el repositorio**. Gradle la busca en
+`~/.kpmanager-android/keystore.properties` (o en la ruta de la variable `KPM_KEYSTORE_PROPERTIES`):
+
+```
+storeFile=C:/Users/<usuario>/.kpmanager-android/release.jks
+storePassword=…
+keyAlias=kpmanager
+keyPassword=…
+```
+
+Sin ese fichero, el APK se firma con la clave de depuración del equipo que compila. Android no deja instalar
+encima una versión firmada con otra clave: hay que desinstalar la anterior (antes, haz una copia de seguridad
+desde Ajustes y restáurala después).
 
 ## Compatibilidad con Windows
 

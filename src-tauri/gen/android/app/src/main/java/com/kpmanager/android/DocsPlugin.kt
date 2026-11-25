@@ -40,6 +40,12 @@ class CopyArgs {
   var clearAfterMs: Long = 30_000
 }
 
+@InvokeArg
+class ShareArgs {
+  lateinit var text: String
+  lateinit var title: String
+}
+
 private const val CLIP_LABEL = "KP Manager"
 
 /**
@@ -87,6 +93,24 @@ class DocsPlugin(private val activity: Activity) : Plugin(activity) {
         val mine = ++copies
         main.post { cm.addPrimaryClipChangedListener(onClipChanged) }
         main.postDelayed({ if (mine == copies) clearIfOurs() }, args.clearAfterMs)
+        invoke.resolve()
+      } catch (ex: Exception) {
+        invoke.reject("failed")
+      }
+    }
+  }
+
+  /** Menú Compartir del sistema con un texto que llega desde Rust. */
+  @Command
+  fun shareText(invoke: Invoke) {
+    val args = invoke.parseArgs(ShareArgs::class.java)
+    main.post {
+      try {
+        val send = Intent(Intent.ACTION_SEND).apply {
+          type = "text/plain"
+          putExtra(Intent.EXTRA_TEXT, args.text)
+        }
+        activity.startActivity(Intent.createChooser(send, args.title))
         invoke.resolve()
       } catch (ex: Exception) {
         invoke.reject("failed")

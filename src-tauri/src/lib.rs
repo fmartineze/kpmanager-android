@@ -110,6 +110,15 @@ impl Session {
         with_keys(&views(&self.data), &self.config.library)
     }
 
+    /// Limpia las copias locales de vaults (caducadas, huérfanas, sueltas) y guarda si cambió algo.
+    fn prune_cache(&mut self, paths: &Paths) -> Result<()> {
+        let live: std::collections::HashSet<&str> = self.data.vaults.iter().map(|v| v.id.as_str()).collect();
+        if self.config.prune_cache(&live, paths, config::now()) {
+            self.save(paths)?;
+        }
+        Ok(())
+    }
+
     fn save(&self, paths: &Paths) -> Result<()> {
         paths.save(&self.cfg_keys, &self.config)
     }
@@ -299,6 +308,8 @@ async fn wizard_finish(state: State<'_, AppState>, folder_id: String, data_id: S
         synced_at: Some(config::now()),
         library,
         vault_files: Default::default(),
+        vault_used: Default::default(),
+        cache_days: config::DEFAULT_CACHE_DAYS,
     };
     state.paths.write_data(&blob)?;
     state.paths.save(&cfg_keys, &config)?;
@@ -376,7 +387,9 @@ async fn unlock_with(state: &AppState, password: Zeroizing<String>) -> Result<Ve
         Ok((cfg_keys, config, data_keys, data))
     })
     .await?;
-    let s = Session { cfg_keys, config, data_keys, data, tokens: None };
+    let mut s = Session { cfg_keys, config, data_keys, data, tokens: None };
+    // Una limpieza que falla no impide desbloquear.
+    let _ = s.prune_cache(&state.paths);
     let out = s.vaults();
     state.inner.lock().await.session = Some(s);
     Ok(out)
@@ -481,6 +494,10 @@ async fn sync(state: State<'_, AppState>) -> Result<SyncResult> {
     s.config.data_file = meta;
     s.config.synced_at = Some(config::now());
     s.save(&state.paths)?;
+    if changed {
+        // Vaults que ya no están en el fichero de datos: fuera sus copias.
+        let _ = s.prune_cache(&state.paths);
+    }
     Ok(SyncResult { changed, vaults: s.vaults(), synced_at: s.config.synced_at })
 }
 
@@ -629,6 +646,13 @@ async fn open_vault(state: State<'_, AppState>, vault_id: String) -> Result<Open
         // Se bloqueó mientras se abría.
         return Err(AppError::Locked);
     }
+    {
+        // Para la caducidad de la copia local.
+        let mut inner = state.inner.lock().await;
+        let s = inner.session.as_mut().ok_or(AppError::Locked)?;
+        s.config.vault_used.insert(vault_id.clone(), config::now());
+        s.save(&state.paths)?;
+    }
     state.vault.set(vault_id, db);
     Ok(Opened { tree, offline })
 }
@@ -662,6 +686,25 @@ const CLIPBOARD_MS: u64 = 30_000;
 async fn copy_secret(app: AppHandle, state: State<'_, AppState>, vault_id: String, entry: String, field: String) -> Result<()> {
     let text = state.vault.with(&vault_id, |db| vaultdb::secret(db, &entry, &field))?;
     blocking(move || docs::copy(&app, &text, CLIPBOARD_MS)).await
+}
+
+/// Comparte una entrada como texto (título, usuario, contraseña y dirección; opcionalmente campos y notas) con
+/// el menú Compartir de Android. El texto se construye aquí y va directo al sistema, sin pasar por la interfaz.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn share_entry(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    vault_id: String,
+    entry: String,
+    include_custom: bool,
+    include_notes: bool,
+    lang: String,
+    title: String,
+) -> Result<()> {
+    let opts = vaultdb::ReportOptions { include_custom, include_notes };
+    let text = state.vault.with(&vault_id, |db| vaultdb::report(db, &[entry], opts, &lang))?;
+    blocking(move || docs::share(&app, &text, &title)).await
 }
 
 /// Guarda un adjunto donde elija el usuario. Devuelve el nombre, o nada si canceló.
@@ -761,6 +804,50 @@ async fn bio_unlock(app: AppHandle, state: State<'_, AppState>, title: String, c
     }
 }
 
+// ── Copias sin conexión ──────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct CacheInfo {
+    count: usize,
+    bytes: u64,
+    days: u32,
+}
+
+fn cache_info_of(s: &Session, paths: &Paths) -> CacheInfo {
+    let files = paths.list_kdbx();
+    CacheInfo { count: files.len(), bytes: files.iter().map(|(_, n)| n).sum(), days: s.config.cache_days }
+}
+
+#[tauri::command]
+async fn cache_info(state: State<'_, AppState>) -> Result<CacheInfo> {
+    let inner = state.inner.lock().await;
+    Ok(cache_info_of(inner.session.as_ref().ok_or(AppError::Locked)?, &state.paths))
+}
+
+/// Borra todas las copias locales de vaults. No toca la configuración, los ficheros de clave ni la huella.
+#[tauri::command]
+async fn cache_clear(state: State<'_, AppState>) -> Result<CacheInfo> {
+    state.vault.close();
+    let inner = state.inner.lock().await;
+    let s = inner.session.as_ref().ok_or(AppError::Locked)?;
+    state.paths.clear_kdbx()?;
+    Ok(cache_info_of(s, &state.paths))
+}
+
+/// Días sin abrir tras los que se borra la copia de un vault (0 = nunca).
+#[tauri::command]
+async fn set_cache_days(state: State<'_, AppState>, days: u32) -> Result<CacheInfo> {
+    if days > 365 {
+        return Err(AppError::msg("internal"));
+    }
+    let mut inner = state.inner.lock().await;
+    let s = inner.session.as_mut().ok_or(AppError::Locked)?;
+    s.config.cache_days = days;
+    s.save(&state.paths)?;
+    s.prune_cache(&state.paths)?;
+    Ok(cache_info_of(s, &state.paths))
+}
+
 // ── Copia de seguridad ───────────────────────────────────────────────────────────────────────────
 
 /// Guarda la copia de seguridad donde elija el usuario. Devuelve el nombre, o nada si canceló.
@@ -831,6 +918,10 @@ pub fn run() {
             reveal_secret,
             copy_secret,
             save_attachment,
+            share_entry,
+            cache_info,
+            cache_clear,
+            set_cache_days,
             open_link,
             bio_status,
             bio_enable,

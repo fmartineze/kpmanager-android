@@ -108,6 +108,18 @@ pub fn clear_clipboard<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Abre el menú Compartir de Android con un texto (WhatsApp, Telegram, correo…).
+#[cfg(target_os = "android")]
+pub fn share<R: Runtime>(app: &AppHandle<R>, text: &str, title: &str) -> Result<()> {
+    let args = serde_json::json!({ "text": text, "title": title });
+    handle(app)?.run_mobile_plugin::<serde_json::Value>("shareText", args).map(|_| ()).map_err(|_| AppError::msg("shareFailed"))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn share<R: Runtime>(_app: &AppHandle<R>, _text: &str, _title: &str) -> Result<()> {
+    Err(AppError::msg("unsupported"))
+}
+
 #[cfg(not(target_os = "android"))]
 pub fn copy<R: Runtime>(_app: &AppHandle<R>, _text: &str, _clear_after_ms: u64) -> Result<()> {
     Err(AppError::msg("unsupported"))

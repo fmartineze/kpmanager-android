@@ -1,7 +1,7 @@
 //! Lectura (solo lectura) de un `.kdbx` para navegarlo desde la app.
 //!
 //! Copia adaptada de `vaultdb.rs` de la app de Windows: aquí el fichero llega como bytes (descargado de OneDrive
-//! o de la caché del móvil) y el fichero de clave sale de la biblioteca. Sin el informe para compartir.
+//! o de la caché del móvil) y el fichero de clave sale de la biblioteca.
 // Se deja igual que el de Windows para poder compararlos.
 #![allow(clippy::collapsible_if)]
 //!
@@ -490,6 +490,74 @@ pub fn attachment(db: &Database, entry_id: &str, name: &str) -> Result<Zeroizing
     Ok(Zeroizing::new(a.data.get().clone()))
 }
 
+// ───────────────────────── Informe para compartir ─────────────────────────
+
+/// Tope de entradas por informe: es para enviar unas pocas credenciales, no para volcar un vault.
+pub const MAX_REPORT_ENTRIES: usize = 100;
+
+/// Qué incluir además de título, usuario, contraseña y dirección.
+#[derive(Clone, Copy)]
+pub struct ReportOptions {
+    pub include_custom: bool,
+    pub include_notes: bool,
+}
+
+/// Etiquetas del informe en el idioma de la interfaz (cualquier otro idioma usa inglés).
+fn labels(lang: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    match lang {
+        "es" => ("Usuario", "Contraseña", "Dirección", "Notas"),
+        _ => ("Username", "Password", "Address", "Notes"),
+    }
+}
+
+/// Texto plano listo para pegar en una herramienta de compartir secretos. Se construye aquí, en Rust:
+/// las contraseñas no pasan por la interfaz. Nunca incluye el código TOTP (caduca en segundos) ni su semilla,
+/// ni adjuntos. Los campos vacíos se omiten.
+pub fn report(db: &Database, entry_ids: &[String], opts: ReportOptions, lang: &str) -> Result<Zeroizing<String>> {
+    if entry_ids.is_empty() || entry_ids.len() > MAX_REPORT_ENTRIES {
+        return Err(AppError::msg("reportCount"));
+    }
+    let (l_user, l_pass, l_url, l_notes) = labels(lang);
+    let mut out = Zeroizing::new(String::with_capacity(512 * entry_ids.len()));
+    for (i, raw) in entry_ids.iter().enumerate() {
+        let e = db.entry(parse_entry_id(raw)?).ok_or(AppError::NotFound)?;
+        if i > 0 {
+            out.push('\n');
+        }
+        let title = e.get_title().filter(|t| !t.trim().is_empty()).unwrap_or("-");
+        out.push_str(&format!("== {} ==\n", one_line(title)));
+        let mut line = |label: &str, value: Option<&str>| {
+            if let Some(v) = value.filter(|v| !v.is_empty()) {
+                out.push_str(&format!("{label}: {}\n", one_line(v)));
+            }
+        };
+        line(l_user, e.get(fields::USERNAME));
+        line(l_pass, e.get(fields::PASSWORD));
+        line(l_url, e.get(fields::URL));
+        if opts.include_custom {
+            let mut names: Vec<&String> = e.fields.keys().filter(|k| is_custom_field(k)).collect();
+            names.sort();
+            for name in names {
+                line(&one_line(name), e.get(name));
+            }
+        }
+        if opts.include_notes {
+            if let Some(n) = e.get(fields::NOTES).filter(|n| !n.trim().is_empty()) {
+                out.push_str(&format!("{l_notes}:\n"));
+                for l in n.lines() {
+                    out.push_str(&format!("  {l}\n"));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Un valor de una sola línea: los saltos dentro de un campo no deben partir el informe.
+fn one_line(s: &str) -> String {
+    s.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +729,23 @@ mod tests {
         assert!(open(&data, Some(PW), Some(&keyfile)).is_ok());
         assert!(open(&data, Some(PW), None).is_err(), "sin fichero de clave no abre");
         assert!(open(&data, Some(PW), Some(b"otra clave")).is_err());
+    }
+
+    #[test]
+    fn report_contains_only_the_selected_entry_and_no_totp() {
+        let db = open_pw(&sample(tiny_png())).unwrap();
+        let id = tree(&db, true).entries[0].id.clone();
+        let r = report(&db, std::slice::from_ref(&id), ReportOptions { include_custom: false, include_notes: false }, "es").unwrap();
+        assert!(r.contains("== Panel ==") && r.contains("Usuario: admin") && r.contains("Contraseña: SECRETO-123"));
+        assert!(r.contains("Dirección: https://example.com"));
+        for no in ["CLAVE-EN-NOTA", "TOKEN-XYZ", "A-1", "JBSWY3DPEHPK3PXP", "otpauth", "contenido"] {
+            assert!(!r.contains(no), "no debería incluir {no}");
+        }
+        let full = report(&db, &[id], ReportOptions { include_custom: true, include_notes: true }, "en").unwrap();
+        assert!(full.contains("Password: SECRETO-123") && full.contains("API key: TOKEN-XYZ") && full.contains("Cuenta: A-1"));
+        assert!(full.contains("Notes:\n  nota con CLAVE-EN-NOTA"));
+        assert!(!full.contains("JBSWY3DPEHPK3PXP") && !full.contains("otpauth"));
+        assert!(report(&db, &[], ReportOptions { include_custom: true, include_notes: true }, "es").is_err());
+        assert_eq!(one_line("a\r\nb\nc\rd"), "a b c d");
     }
 }

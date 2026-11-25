@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, BioStatus, errCode, errMsg, Info, isNetwork, KeyFile, KeyState, Library, LoginEvent, pickerOpen, Status, Vault, VaultTree } from "./api";
+import { api, BioStatus, CacheInfo, errCode, errMsg, Info, isNetwork, KeyFile, KeyState, Library, LoginEvent, pickerOpen, Status, Vault, VaultTree } from "./api";
 import { rich, useT } from "./i18n";
 import { setThemePref, ThemePref } from "./theme";
 import { Wizard } from "./components/Wizard";
@@ -9,7 +9,7 @@ import { VaultBrowser } from "./components/VaultBrowser";
 import { FolderPicker } from "./components/FolderPicker";
 import { Modal } from "./components/Modal";
 import { Alert, Note, Segmented } from "./components/ui";
-import { IconAlert, IconCheck, IconDownload, IconEdit, IconFingerprint, IconKey, IconLock, IconRefresh, IconSearch, IconSettings, IconShield, IconStar, IconX } from "./components/Icons";
+import { IconAlert, IconCheck, IconDownload, IconEdit, IconFingerprint, IconKey, IconTrash, IconLock, IconRefresh, IconSearch, IconSettings, IconShield, IconStar, IconX } from "./components/Icons";
 
 type Phase = "loading" | "wizard" | "locked" | "ready";
 type Toast = { msg: string; kind: "ok" | "error"; key: number } | null;
@@ -24,6 +24,7 @@ const BACKGROUND_GRACE_MS = 30 * 1000;
 /** Errores al abrir un vault que se arreglan eligiendo otro fichero de clave. */
 const KEY_ERRORS = ["vaultKeyMissing", "vaultWrongKey", "vaultKeyfile", "vaultNoCredentials"];
 
+const fmtBytes = (n: number) => (n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
 const initial = (s: string) => (s.trim()[0] ?? "?").toUpperCase();
 const hue = (s: string) => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % 6;
 const norm = (s: string) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
@@ -129,6 +130,8 @@ function Settings({ version, keyCount, onClose, onReset, onKeys, onFolder, toast
   const [confirm, setConfirm] = useState(false);
   const [saving, setSaving] = useState(false);
   const [bio, setBio] = useState<BioStatus | null>(null);
+  const [cache, setCache] = useState<CacheInfo | null>(null);
+  const [cacheConfirm, setCacheConfirm] = useState(false);
   const [bioPw, setBioPw] = useState("");
   const [bioBusy, setBioBusy] = useState(false);
   const [theme, setTheme] = useState<ThemePref>(() => {
@@ -143,6 +146,7 @@ function Settings({ version, keyCount, onClose, onReset, onKeys, onFolder, toast
   useEffect(() => {
     api.info().then(setInfo).catch(() => {});
     api.bioStatus().then(setBio).catch(() => {});
+    api.cacheInfo().then(setCache).catch(() => {});
     const un = listen<LoginEvent>("login", ({ payload }) => {
       if (payload.account) {
         toast(t("wiz.signedAs", { name: payload.account.upn }).replace(/<\/?b>/g, ""));
@@ -229,6 +233,46 @@ function Settings({ version, keyCount, onClose, onReset, onKeys, onFolder, toast
             </div>
           </form>
         )}
+      </div>
+      <div className="section">
+        <div className="section-title">{t("set.cache")}</div>
+        <div className="kv">
+          <span>{t("set.cacheStored")}</span>
+          <b>{cache ? (cache.count === 0 ? t("set.cacheNone") : t("set.cacheCount", { n: cache.count, size: fmtBytes(cache.bytes) })) : "…"}</b>
+        </div>
+        <div className="label">{t("set.cacheDays")}</div>
+        <Segmented
+          label={t("set.cacheDays")}
+          value={String(cache?.days ?? 30)}
+          onChange={(v) => api.setCacheDays(Number(v)).then(setCache).catch((e) => toast(errMsg(e), "error"))}
+          options={[
+            { value: "7", label: t("set.cacheDaysN", { n: 7 }) },
+            { value: "30", label: t("set.cacheDaysN", { n: 30 }) },
+            { value: "90", label: t("set.cacheDaysN", { n: 90 }) },
+            { value: "0", label: t("set.cacheNever") },
+          ]}
+        />
+        <Note>{t("set.cacheHelp")}</Note>
+        <div className="btns">
+          {cacheConfirm ? (
+            <>
+              <button className="btn btn-danger-solid btn-sm" onClick={async () => {
+                setCacheConfirm(false);
+                try {
+                  setCache(await api.cacheClear());
+                  toast(t("set.cacheCleared"));
+                } catch (e) {
+                  toast(errMsg(e), "error");
+                }
+              }}>{t("set.cacheClearConfirm")}</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setCacheConfirm(false)}>{t("common.cancel")}</button>
+            </>
+          ) : (
+            <button className="btn btn-danger btn-sm" disabled={!cache || cache.count === 0} onClick={() => setCacheConfirm(true)}>
+              <IconTrash className="s14" /> {t("set.cacheClear")}
+            </button>
+          )}
+        </div>
       </div>
       <div className="section">
         <div className="section-title">{t("set.keys")}</div>

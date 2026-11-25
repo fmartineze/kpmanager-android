@@ -1,12 +1,13 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { api, CLIPBOARD_SECS, EntryDetail, EntryRow, errMsg, GroupNode, Totp, Vault, VaultTree } from "../api";
-import { useT } from "../i18n";
+import { getLang, useT } from "../i18n";
 import { Markdown } from "./Markdown";
 import { VaultIcon } from "./VaultIcon";
-import { Note } from "./ui";
+import { Alert, Check, Note } from "./ui";
+import { Modal } from "./Modal";
 import {
   IconAlert, IconBack, IconClock, IconCopy, IconDownload, IconExternal, IconEye, IconEyeOff, IconFolder, IconHome, IconPaperclip,
-  IconSearch, IconX,
+  IconSearch, IconShare, IconX,
 } from "./Icons";
 
 type Notify = (msg: string, kind?: "ok" | "error") => void;
@@ -250,6 +251,7 @@ function EntryView({ vault, row, groupName, custom, onBack, onHome, onLink, noti
   const [totp, setTotp] = useState<Totp | null>(null);
   const [left, setLeft] = useState(0);
   const [mode, setMode] = useState<"md" | "text">(readMode);
+  const [sharing, setSharing] = useState(false);
   const timers = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -362,6 +364,7 @@ function EntryView({ vault, row, groupName, custom, onBack, onHome, onLink, noti
             <span className="crumbs"><span className="crumb on">{[vault.client, groupName].filter(Boolean).join(" › ")}</span></span>
           </div>
           {row.icon && <span className="vicon big"><VaultIcon icon={row.icon} kind="entry" custom={custom} /></span>}
+          <button className="btn btn-icon" onClick={() => setSharing(true)} disabled={!d} aria-label={t("share.title")}><IconShare /></button>
           <button className="btn btn-icon" onClick={onHome} aria-label={t("vault.home")}><IconHome /></button>
         </div>
       </div>
@@ -430,6 +433,55 @@ function EntryView({ vault, row, groupName, custom, onBack, onHome, onLink, noti
           </>
         )}
       </div>
+      {sharing && d && (
+        <ShareDialog vault={vault} entry={d} onClose={() => setSharing(false)} notify={notify} />
+      )}
     </>
+  );
+}
+
+/**
+ * Compartir una entrada con otra app (WhatsApp, Telegram, correo…). El texto lo construye Rust y lo entrega al
+ * menú Compartir de Android; aquí solo se elige qué incluir.
+ */
+function ShareDialog({ vault, entry, onClose, notify }: { vault: Vault; entry: EntryDetail; onClose: () => void; notify: Notify }) {
+  const t = useT();
+  const [custom, setCustom] = useState(false);
+  const [notes, setNotes] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const hasCustom = entry.fields.length > 0;
+
+  async function share() {
+    setBusy(true);
+    try {
+      await api.shareEntry(vault.id, entry.id, custom, notes, getLang(), t("share.chooser"));
+      onClose();
+    } catch (e) {
+      notify(errMsg(e), "error");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title={t("share.title")}
+      subtitle={entry.title || t("vault.untitled")}
+      icon={<IconShare className="s16" />}
+      onClose={onClose}
+      footer={
+        <button className="btn btn-primary btn-block" onClick={share} disabled={busy}>
+          {busy ? <span className="spin" /> : <IconShare className="s16" />} {t("share.go")}
+        </button>
+      }
+    >
+      <Alert kind="err"><b>{t("share.warnTitle")}</b> {t("share.warn")}</Alert>
+      <div className="section">
+        <span className="section-title">{t("share.include")}</span>
+        <div className="help">{t("share.always")}</div>
+        {hasCustom && <Check checked={custom} onChange={setCustom}>{t("share.custom")}</Check>}
+        {entry.notes && <Check checked={notes} onChange={setNotes}>{t("share.notes")}</Check>}
+        {notes && <div className="help">{t("share.notesHelp")}</div>}
+      </div>
+    </Modal>
   );
 }
