@@ -99,3 +99,9 @@
 .kv-edit { display: flex; align-items: center; gap: 4px; }
 .kv-edit .kv { flex: 1; min-width: 0; }
 .kv-edit .btn-icon { flex: none; color: var(--kp-text-2); }
+
+/* Aviso de versión nueva sobre la lista */
+.update-bar { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 6px 6px 6px 12px; border-radius: var(--kp-radius-md);
+  background: var(--kp-accent-soft); color: var(--kp-accent-text); font-size: var(--kp-fs-sm); }
+.update-bar span { flex: 1; min-width: 0; }
+.update-bar .btn-link { flex: none; font-weight: 650; }

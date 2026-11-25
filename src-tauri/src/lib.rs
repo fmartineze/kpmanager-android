@@ -11,6 +11,7 @@ mod error;
 mod graph;
 mod library;
 mod model;
+mod update;
 mod vaultdb;
 
 use serde::Serialize;
@@ -129,6 +130,17 @@ struct Inner {
     wizard: Wizard,
     session: Option<Session>,
     login: Option<PendingLogin>,
+    /// Cambio de maestra a medias: la contraseña ya escrita (solo en memoria, hasta completarlo o bloquear).
+    rekey: Option<Rekey>,
+}
+
+/// La maestra cambió en Windows. Para no repetir el asistente hacen falta las dos: la anterior abre la
+/// configuración del móvil y la nueva el fichero de datos. Se guarda la primera que se escribe.
+enum Rekey {
+    /// Se escribió la anterior (abre la configuración pero no los datos): falta la nueva.
+    HaveOld(Zeroizing<String>),
+    /// Se escribió la nueva (abre los datos pero no la configuración): falta la anterior.
+    HaveNew(Zeroizing<String>),
 }
 
 struct AppState {
@@ -159,7 +171,11 @@ async fn status(state: State<'_, AppState>) -> Result<Status> {
 /// cuando el usuario va a pegarlo en otra; en ese caso se borra solo pasado su tiempo.
 #[tauri::command]
 async fn lock(app: AppHandle, state: State<'_, AppState>, clear_clipboard: bool) -> Result<()> {
-    state.inner.lock().await.session = None;
+    {
+        let mut inner = state.inner.lock().await;
+        inner.session = None;
+        inner.rekey = None;
+    }
     state.vault.close();
     if clear_clipboard {
         let _ = blocking(move || {
@@ -374,25 +390,111 @@ async fn unlock(state: State<'_, AppState>, password: String) -> Result<Vec<Vaul
     unlock_with(&state, Zeroizing::new(password)).await
 }
 
+/// Resultado de probar una maestra.
+enum Tried {
+    Open(Box<(Keys, Config, Keys, Data)>),
+    /// Abre la configuración pero no los datos: es la anterior; la maestra cambió en Windows.
+    IsOld,
+    /// No abre la configuración pero sí los datos: ya es la nueva de Windows.
+    IsNew,
+}
+
+/// Prueba una maestra contra la configuración y el fichero de datos guardados en el móvil.
+fn try_master(paths: &Paths, password: &str) -> Result<Tried> {
+    let blob = paths.read_data()?;
+    Ok(match paths.load(password) {
+        Ok((cfg_keys, config)) => match open_data(password, &blob) {
+            Ok((data_keys, data)) => Tried::Open(Box::new((cfg_keys, config, data_keys, data))),
+            Err(AppError::WrongPassword) => Tried::IsOld,
+            Err(e) => return Err(e),
+        },
+        // Antes de decir «incorrecta», se mira si es ya la maestra nueva de Windows.
+        Err(AppError::WrongPassword) => match open_data(password, &blob) {
+            Ok(_) => Tried::IsNew,
+            Err(e) => return Err(e),
+        },
+        Err(e) => return Err(e),
+    })
+}
+
+/// Vuelve a cifrar la configuración del móvil con la maestra nueva (y quita la huella, que guardaba la anterior).
+fn rewrap(paths: &Paths, old: &str, new: &str) -> Result<(Keys, Config, Keys, Data)> {
+    let (_, config) = paths.load(old).map_err(|e| match e {
+        AppError::WrongPassword => AppError::msg("rekeyOldWrong"),
+        e => e,
+    })?;
+    let (data_keys, data) = open_data(new, &paths.read_data()?).map_err(|e| match e {
+        AppError::WrongPassword => AppError::msg("rekeyNewWrong"),
+        e => e,
+    })?;
+    let cfg_keys = Paths::new_keys(new)?;
+    paths.save(&cfg_keys, &config)?;
+    paths.remove_bio();
+    Ok((cfg_keys, config, data_keys, data))
+}
+
 async fn unlock_with(state: &AppState, password: Zeroizing<String>) -> Result<Vec<VaultView>> {
     let paths = state.paths.clone();
-    let (cfg_keys, config, data_keys, data) = blocking(move || {
-        let (cfg_keys, config) = paths.load(&password)?;
-        let blob = paths.read_data()?;
-        // La maestra abre la configuración pero no los datos: se cambió en Windows después de configurar el móvil.
-        let (data_keys, data) = open_data(&password, &blob).map_err(|e| match e {
-            AppError::WrongPassword => AppError::msg("masterChanged"),
-            e => e,
-        })?;
-        Ok((cfg_keys, config, data_keys, data))
-    })
-    .await?;
-    let mut s = Session { cfg_keys, config, data_keys, data, tokens: None };
+    let (tried, password) = blocking(move || Ok((try_master(&paths, &password)?, password))).await?;
+    let (cfg_keys, config, data_keys, data) = match tried {
+        Tried::Open(open) => *open,
+        Tried::IsOld => {
+            state.inner.lock().await.rekey = Some(Rekey::HaveOld(password));
+            return Err(AppError::msg("masterChanged"));
+        }
+        Tried::IsNew => {
+            state.inner.lock().await.rekey = Some(Rekey::HaveNew(password));
+            return Err(AppError::msg("masterNew"));
+        }
+    };
+    start_session(state, Session { cfg_keys, config, data_keys, data, tokens: None }).await
+}
+
+async fn start_session(state: &AppState, mut s: Session) -> Result<Vec<VaultView>> {
     // Una limpieza que falla no impide desbloquear.
     let _ = s.prune_cache(&state.paths);
     let out = s.vaults();
-    state.inner.lock().await.session = Some(s);
+    let mut inner = state.inner.lock().await;
+    inner.session = Some(s);
+    inner.rekey = None;
     Ok(out)
+}
+
+/// Completa el cambio de maestra con la contraseña que faltaba: vuelve a cifrar la configuración del móvil con
+/// la nueva y desbloquea. Se conservan cuenta, carpeta, ficheros de clave y copias. La huella guardaba la
+/// anterior: se desactiva.
+#[tauri::command]
+async fn rekey(state: State<'_, AppState>, password: String) -> Result<Vec<VaultView>> {
+    let pending = state.inner.lock().await.rekey.take().ok_or_else(|| AppError::msg("rekeyExpired"))?;
+    let typed = Zeroizing::new(password);
+    let (old, new, typed_is_old) = match &pending {
+        Rekey::HaveOld(o) => (o.clone(), typed, false),
+        Rekey::HaveNew(n) => (typed, n.clone(), true),
+    };
+    let paths = state.paths.clone();
+    match blocking(move || rewrap(&paths, &old, &new)).await {
+        Ok((cfg_keys, config, data_keys, data)) => {
+            start_session(&state, Session { cfg_keys, config, data_keys, data, tokens: None }).await
+        }
+        Err(e) => {
+            // Si falló la que se acaba de escribir, la otra sigue valiendo: se puede reintentar sin empezar de nuevo.
+            let typed_wrong = match &e {
+                AppError::Msg { code: "rekeyOldWrong", .. } => typed_is_old,
+                AppError::Msg { code: "rekeyNewWrong", .. } => !typed_is_old,
+                _ => false,
+            };
+            if typed_wrong {
+                state.inner.lock().await.rekey = Some(pending);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Versión nueva publicada en GitHub, si la hay.
+#[tauri::command]
+async fn check_update(state: State<'_, AppState>) -> Result<Option<update::Release>> {
+    update::check(&state.http).await
 }
 
 #[derive(Serialize)]
@@ -483,8 +585,22 @@ async fn sync(state: State<'_, AppState>) -> Result<SyncResult> {
     let s = inner.session.as_mut().ok_or(AppError::Locked)?;
     let changed = match blob {
         Some(blob) => {
-            // Misma clave mientras no cambie la maestra en Windows; si cambió, hay que volver a desbloquear.
-            let plain = s.data_keys.open_with_key(&blob)?;
+            // Misma clave mientras no cambie la maestra en Windows. Si cambió, se guarda el fichero nuevo y se
+            // bloquea: al desbloquear se pide la maestra nueva (ver `unlock_with` y `rekey`).
+            let plain = match s.data_keys.open_with_key(&blob) {
+                Ok(p) => p,
+                Err(AppError::Msg { code: "dataKeyChanged", .. }) => {
+                    state.paths.write_data(&blob)?;
+                    s.config.data_file = meta;
+                    s.config.synced_at = Some(config::now());
+                    s.save(&state.paths)?;
+                    inner.session = None;
+                    drop(inner);
+                    state.vault.close();
+                    return Err(AppError::msg("masterChangedSync"));
+                }
+                Err(e) => return Err(e),
+            };
             s.data = Data::parse(&plain)?;
             state.paths.write_data(&blob)?;
             true
@@ -927,6 +1043,8 @@ pub fn run() {
             bio_enable,
             bio_disable,
             bio_unlock,
+            rekey,
+            check_update,
         ])
         .run(tauri::generate_context!())
         .expect("error al arrancar KP Manager");
@@ -948,6 +1066,47 @@ mod tests {
         assert_eq!(v[0].keyfile.as_deref(), Some("comun.keyx"));
         assert_eq!(v[0].tags, ["Hosting"]);
         assert_eq!((v[1].client.as_str(), v[1].keyfile.as_deref()), ("Otro Cliente", None));
+    }
+
+    /// La maestra cambia en Windows: con la anterior y la nueva se recupera la configuración sin el asistente.
+    #[test]
+    fn master_changed_in_windows_is_recovered_without_the_wizard() {
+        let dir = std::env::temp_dir().join(format!("kpm-android-rekey-{}", std::process::id()));
+        let paths = Paths::new(dir.clone());
+        let cost = crypto::KdfCost { m_kib: 8, t: 1, p: 1 };
+        let data = br#"{"format":1,"settings":{"keepassxc":null,"default_keyfile":null},"vaults":[{"id":"1","client":"Acme","path":"C:/a.kdbx","keyfile":null,"password":"x"}]}"#;
+
+        // Móvil configurado con «vieja»; luego Windows vuelve a cifrar los datos con «nueva».
+        let cfg_keys = Keys::new("vieja", cost).unwrap();
+        let mut config_text = serde_json::json!({
+            "version": 1,
+            "reg": { "tenant": "contoso.com", "client_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0" },
+            "account": { "name": "Ana", "upn": "ana@contoso.com" },
+            "folder": { "id": "F", "name": "C", "folder": true, "path": "/C", "etag": "" },
+            "data_file": { "id": "D", "name": "vaults.enc", "folder": false, "path": "/C/vaults.enc", "etag": "" },
+            "refresh_token": "token"
+        });
+        config_text["library"] = serde_json::json!({ "keys": [], "default_key": null, "assign": {} });
+        let config: Config = serde_json::from_value(config_text).unwrap();
+        paths.save(&cfg_keys, &config).unwrap();
+        paths.write_data(&Keys::new("nueva", cost).unwrap().encrypt(data).unwrap()).unwrap();
+        paths.write_bio(b"maestra-vieja-cifrada").unwrap();
+
+        assert!(matches!(try_master(&paths, "vieja"), Ok(Tried::IsOld)));
+        let r = try_master(&paths, "nueva");
+        assert!(matches!(r, Ok(Tried::IsNew)), "{:?}", r.as_ref().err());
+        assert!(matches!(try_master(&paths, "otra"), Err(AppError::WrongPassword)));
+
+        assert!(matches!(rewrap(&paths, "otra", "nueva"), Err(AppError::Msg { code: "rekeyOldWrong", .. })));
+        assert!(matches!(rewrap(&paths, "vieja", "otra"), Err(AppError::Msg { code: "rekeyNewWrong", .. })));
+        let (_, cfg, _, d) = rewrap(&paths, "vieja", "nueva").unwrap();
+        assert_eq!((cfg.account.upn.as_str(), d.vaults.len()), ("ana@contoso.com", 1));
+        assert!(!paths.bio_enabled(), "la huella guardaba la maestra anterior");
+
+        // A partir de ahora abre con la nueva y ya no con la anterior.
+        assert!(matches!(try_master(&paths, "nueva"), Ok(Tried::Open(..))));
+        assert!(matches!(try_master(&paths, "vieja"), Err(AppError::WrongPassword)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

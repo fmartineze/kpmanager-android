@@ -69,6 +69,12 @@ export interface CacheInfo {
   days: number;
 }
 
+/** Versión nueva publicada en GitHub. */
+export interface Release {
+  version: string;
+  url: string;
+}
+
 export interface Library {
   added: string | null;
   keys: KeyFile[];
@@ -194,6 +200,10 @@ export const api = {
   restorePick: () => withPicker(() => invoke<string | null>("wizard_restore_pick")),
   restoreOpen: (password: string) => invoke<RestoreInfo>("wizard_restore_open", { password }),
   unlock: (password: string) => invoke<Vault[]>("unlock", { password }),
+  /** Completa el cambio de maestra con la contraseña que faltaba (la nueva o la anterior). */
+  rekey: (password: string) => invoke<Vault[]>("rekey", { password }),
+  /** Versión más nueva publicada, si la hay (la consulta la hace Rust). */
+  checkUpdate: () => invoke<Release | null>("check_update"),
   info: () => invoke<Info>("info"),
   /** Cambia la carpeta de origen (los vaults); no cambia el fichero de datos. */
   setFolder: (folderId: string) => invoke<Info>("set_folder", { folderId }),

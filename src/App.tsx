@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, BioStatus, CacheInfo, errCode, errMsg, Info, isNetwork, KeyFile, KeyState, Library, LoginEvent, pickerOpen, Status, Vault, VaultTree } from "./api";
+import { api, BioStatus, CacheInfo, Release, errCode, errMsg, Info, isNetwork, KeyFile, KeyState, Library, LoginEvent, pickerOpen, Status, Vault, VaultTree } from "./api";
 import { rich, useT } from "./i18n";
 import { setThemePref, ThemePref } from "./theme";
 import { Wizard } from "./components/Wizard";
@@ -8,7 +8,7 @@ import { KeysModal, VaultSheet } from "./components/Keys";
 import { VaultBrowser } from "./components/VaultBrowser";
 import { FolderPicker } from "./components/FolderPicker";
 import { Modal } from "./components/Modal";
-import { Alert, Note, Segmented } from "./components/ui";
+import { Alert, Check, Note, Segmented } from "./components/ui";
 import { IconAlert, IconCheck, IconDownload, IconEdit, IconFingerprint, IconKey, IconTrash, IconLock, IconRefresh, IconSearch, IconSettings, IconShield, IconStar, IconX } from "./components/Icons";
 
 type Phase = "loading" | "wizard" | "locked" | "ready";
@@ -23,6 +23,28 @@ const AUTO_LOCK_MS = 3 * 60 * 1000;
 const BACKGROUND_GRACE_MS = 30 * 1000;
 /** Errores al abrir un vault que se arreglan eligiendo otro fichero de clave. */
 const KEY_ERRORS = ["vaultKeyMissing", "vaultWrongKey", "vaultKeyfile", "vaultNoCredentials"];
+
+// Preferencias de este móvil que no son secretas (en el almacenamiento del WebView).
+function readPref(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writePref(key: string, value: string | null) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {
+    /* sin almacenamiento: no pasa nada */
+  }
+}
+const UPDATE_CHECKS = "kp.checkUpdates";
+const UPDATE_CHECKED_AT = "kp.updateCheckedAt";
+const UPDATE_IGNORED = "kp.ignoredUpdate";
+/** Como mucho una consulta a GitHub al día. */
+const UPDATE_EVERY_MS = 24 * 60 * 60 * 1000;
 
 const fmtBytes = (n: number) => (n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
 const initial = (s: string) => (s.trim()[0] ?? "?").toUpperCase();
@@ -39,21 +61,39 @@ function autoKey(v: Vault, keys: KeyFile[]): KeyState {
   return k ? { ...none, id: k.id, name: k.name, by: byName ? "name" : "default" } : { ...none, missing: true };
 }
 
-function Unlock({ onUnlocked }: { onUnlocked: (v: Vault[]) => void }) {
+/**
+ * Pantalla de desbloqueo. Si la maestra cambió en Windows, pide la otra (la nueva o la anterior, según la que se
+ * escribió) y actualiza el móvil sin repetir el asistente.
+ */
+function Unlock({ onUnlocked, notice }: { onUnlocked: (v: Vault[], rekeyed: boolean) => void; notice: string | null }) {
   const t = useT();
   const [pw, setPw] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [shake, setShake] = useState(false);
   const [bio, setBio] = useState(false);
+  // `new`: se escribió la anterior y falta la nueva; `old`: al revés.
+  const [mode, setMode] = useState<"normal" | "new" | "old">("normal");
+
+  const failed = (e: unknown) => {
+    const code = errCode(e);
+    if (code === "masterChanged" || code === "masterNew") {
+      setMode(code === "masterChanged" ? "new" : "old");
+      setError("");
+      setPw("");
+      return;
+    }
+    setError(errMsg(e));
+    setShake(true);
+  };
 
   const tryBio = useCallback(async () => {
     setError("");
     try {
       const v = await api.bioUnlock(t("unlock.bioTitle"), t("unlock.bioCancel"));
-      if (v) onUnlocked(v);
+      if (v) onUnlocked(v, false);
     } catch (e) {
-      setError(errMsg(e));
+      failed(e);
       if (errCode(e) === "bioInvalidated") setBio(false);
     }
   }, [onUnlocked, t]);
@@ -80,12 +120,14 @@ function Unlock({ onUnlocked }: { onUnlocked: (v: Vault[]) => void }) {
     setBusy(true);
     setError("");
     try {
-      const v = await api.unlock(pw);
+      const rekeying = mode !== "normal";
+      const v = rekeying ? await api.rekey(pw) : await api.unlock(pw);
       setPw("");
-      onUnlocked(v);
+      onUnlocked(v, rekeying);
     } catch (err) {
-      setError(errMsg(err));
-      setShake(true);
+      // Si caducó lo escrito antes (se bloqueó entre medias), se vuelve a empezar.
+      if (errCode(err) === "rekeyExpired") setMode("normal");
+      failed(err);
     } finally {
       setBusy(false);
     }
@@ -95,18 +137,29 @@ function Unlock({ onUnlocked }: { onUnlocked: (v: Vault[]) => void }) {
     <div className="auth">
       <div className="shield-wrap"><div className="shield"><IconShield /></div></div>
       <span className="chip-lock"><IconLock className="s14" /> {t("unlock.chip")}</span>
-      <h1>{t("unlock.title")}</h1>
-      <p className="lede">{rich(t("unlock.lede"))}</p>
+      <h1>{mode === "normal" ? t("unlock.title") : t("unlock.rekeyTitle")}</h1>
+      <p className="lede">{rich(t(mode === "new" ? "unlock.rekeyNew" : mode === "old" ? "unlock.rekeyOld" : "unlock.lede"))}</p>
+      {mode === "normal" && notice && <Note>{notice}</Note>}
       <form className={`form ${shake ? "shake" : ""}`} onSubmit={submit} onAnimationEnd={() => setShake(false)}>
         <div className={`input ${error ? "is-error" : ""}`}>
           <IconKey className="s16" />
-          <input className="input-el" type="password" autoComplete="off" placeholder={t("unlock.master")} value={pw} onChange={(e) => setPw(e.target.value)} />
+          <input className="input-el" type="password" autoComplete="off" autoFocus={mode !== "normal"}
+            placeholder={t(mode === "new" ? "unlock.newMaster" : mode === "old" ? "unlock.oldMaster" : "unlock.master")}
+            value={pw} onChange={(e) => setPw(e.target.value)} />
         </div>
         {error && <Alert kind="err">{error}</Alert>}
         <button className="btn btn-primary btn-block" disabled={busy || !pw}>
-          {busy && <span className="spin" />} {busy ? t("unlock.busy") : t("unlock.unlock")}
+          {busy && <span className="spin" />} {busy ? t("unlock.busy") : mode === "normal" ? t("unlock.unlock") : t("unlock.rekey")}
         </button>
-        {bio && (
+        {mode !== "normal" && (
+          <button type="button" className="btn btn-link" onClick={() => {
+            api.lock(false).catch(() => {});
+            setMode("normal");
+            setPw("");
+            setError("");
+          }}>{t("common.cancel")}</button>
+        )}
+        {bio && mode === "normal" && (
           <button type="button" className="btn btn-secondary btn-block" onClick={tryBio} disabled={busy}>
             <IconFingerprint className="s16" /> {t("unlock.bio")}
           </button>
@@ -116,8 +169,9 @@ function Unlock({ onUnlocked }: { onUnlocked: (v: Vault[]) => void }) {
   );
 }
 
-function Settings({ version, keyCount, onClose, onReset, onKeys, onFolder, toast }: {
+function Settings({ version, keyCount, onClose, onReset, onKeys, onFolder, onCheckUpdate, toast }: {
   version: string;
+  onCheckUpdate: () => Promise<void>;
   keyCount: number;
   onClose: () => void;
   onReset: () => void;
@@ -132,6 +186,8 @@ function Settings({ version, keyCount, onClose, onReset, onKeys, onFolder, toast
   const [bio, setBio] = useState<BioStatus | null>(null);
   const [cache, setCache] = useState<CacheInfo | null>(null);
   const [cacheConfirm, setCacheConfirm] = useState(false);
+  const [updates, setUpdates] = useState(() => readPref(UPDATE_CHECKS) !== "0");
+  const [checking, setChecking] = useState(false);
   const [bioPw, setBioPw] = useState("");
   const [bioBusy, setBioBusy] = useState(false);
   const [theme, setTheme] = useState<ThemePref>(() => {
@@ -307,6 +363,23 @@ function Settings({ version, keyCount, onClose, onReset, onKeys, onFolder, toast
         />
       </div>
       <div className="section">
+        <div className="section-title">{t("set.updates")}</div>
+        <Check checked={updates} onChange={(v) => {
+          setUpdates(v);
+          writePref(UPDATE_CHECKS, v ? null : "0");
+        }}>{t("set.updatesAuto")}</Check>
+        <div className="help">{t("set.updatesHelp")}</div>
+        <div className="btns">
+          <button className="btn btn-secondary btn-sm" disabled={checking} onClick={async () => {
+            setChecking(true);
+            await onCheckUpdate();
+            setChecking(false);
+          }}>
+            {checking ? <span className="spin" /> : <IconRefresh className="s14" />} {t("set.updatesCheck")}
+          </button>
+        </div>
+      </div>
+      <div className="section">
         <div className="section-title">{t("set.reset")}</div>
         <Note>{t("set.resetHelp")}</Note>
         <div className="btns">
@@ -342,6 +415,8 @@ export default function App() {
   const [libBusy, setLibBusy] = useState(false);
   const [browsing, setBrowsing] = useState<{ vault: Vault; tree: VaultTree; offline: boolean } | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
+  const [unlockNotice, setUnlockNotice] = useState<string | null>(null);
+  const [update, setUpdate] = useState<Release | null>(null);
   const toastTimer = useRef<number>(0);
 
   const showToast = useCallback((msg: string, kind: "ok" | "error" = "ok") => {
@@ -419,11 +494,34 @@ export default function App() {
         if (r.changed) showToast(t("sync.updated"));
         else if (manual) showToast(t("sync.same"));
       } catch (e) {
-        if (isNetwork(e)) {
+        if (errCode(e) === "masterChangedSync") {
+          // Rust ya guardó el fichero nuevo y cerró la sesión: al desbloquear se pedirá la maestra nueva.
+          setUnlockNotice(t("unlock.changedSync"));
+          lock(false);
+        } else if (isNetwork(e)) {
           if (manual) showToast(t("sync.offline"), "error");
         } else showToast(errMsg(e), "error");
       } finally {
         setSyncing(false);
+      }
+    },
+    [showToast, t, lock],
+  );
+
+  // Versión nueva: al desbloquear, como mucho una vez al día (o a mano desde Ajustes).
+  const checkUpdate = useCallback(
+    async (manual: boolean) => {
+      if (!manual) {
+        if (readPref(UPDATE_CHECKS) === "0") return;
+        if (Date.now() - Number(readPref(UPDATE_CHECKED_AT) ?? 0) < UPDATE_EVERY_MS) return;
+      }
+      try {
+        const r = await api.checkUpdate();
+        writePref(UPDATE_CHECKED_AT, String(Date.now()));
+        if (r && (manual || readPref(UPDATE_IGNORED) !== r.version)) setUpdate(r);
+        else if (manual) showToast(t("update.latest"));
+      } catch (e) {
+        if (manual) showToast(errMsg(e), "error");
       }
     },
     [showToast, t],
@@ -474,9 +572,12 @@ export default function App() {
     setBrowsing(null);
   };
 
-  const unlocked = (v: Vault[]) => {
+  const unlocked = (v: Vault[], rekeyed = false) => {
     setVaults(v);
     setPhase("ready");
+    setUnlockNotice(null);
+    if (rekeyed) showToast(t("unlock.rekeyed"));
+    checkUpdate(false);
     api.keys().then(applyLib).catch(() => {});
     // Busca cambios en OneDrive en segundo plano; la lista ya se ve con la copia local.
     sync(false);
@@ -501,7 +602,7 @@ export default function App() {
   let body;
   if (phase === "loading") body = <div className="empty"><span className="spin lg" /></div>;
   else if (phase === "wizard") body = <Wizard onDone={(v) => { refreshStatus(); unlocked(v); }} />;
-  else if (phase === "locked") body = <Unlock onUnlocked={unlocked} />;
+  else if (phase === "locked") body = <Unlock onUnlocked={unlocked} notice={unlockNotice} />;
   else if (browsing)
     body = <VaultBrowser vault={browsing.vault} tree={browsing.tree} offline={browsing.offline} onBack={closeVault} notify={showToast} />;
   else
@@ -527,6 +628,16 @@ export default function App() {
             <input className="input-el" type="search" enterKeyHint="search" placeholder={t("search.placeholder")} value={query} onChange={(e) => setQuery(e.target.value)} />
             {query && <button className="clear" onClick={() => setQuery("")} aria-label={t("search.clear")}><IconX className="s14" /></button>}
           </div>
+          {update && (
+            <div className="update-bar">
+              <span>{t("update.available", { v: update.version })}</span>
+              <button className="btn btn-link" onClick={() => api.openLink(update.url).catch((e) => showToast(errMsg(e), "error"))}>{t("update.see")}</button>
+              <button className="btn btn-icon plain" aria-label={t("update.ignore")} onClick={() => {
+                writePref(UPDATE_IGNORED, update.version);
+                setUpdate(null);
+              }}><IconX className="s14" /></button>
+            </div>
+          )}
           {tags.length > 0 && (
             <div className="tagbar" role="group" aria-label={t("list.tagFilter")}>
               <button className={`tagchip ${tag ? "" : "on"}`} onClick={() => setTag(null)}>{t("list.tagAll")}</button>
@@ -633,6 +744,7 @@ export default function App() {
               setSettings(false);
               setFolderOpen(true);
             }}
+            onCheckUpdate={() => checkUpdate(true)}
             onClose={() => setSettings(false)}
             onReset={async () => {
               await api.reset().catch(() => {});

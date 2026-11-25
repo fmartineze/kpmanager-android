@@ -31,6 +31,10 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
   dirección, y si quieres campos personalizados y notas. Nunca el código TOTP ni su semilla. El texto lo
   construye Rust y va directo al menú Compartir de Android, sin pasar por la interfaz.
 - **Desbloqueo con huella** (Ajustes).
+- **Cambio de contraseña maestra en Windows:** al desbloquear, la app pide la otra (la nueva o la anterior) y
+  vuelve a cifrar la configuración del móvil, sin repetir el asistente. La huella hay que volver a activarla.
+- **Aviso de versiones nuevas:** una vez al día se consulta la lista de versiones en GitHub (se puede
+  desactivar en Ajustes).
 - **Copia de seguridad** (Ajustes): cuenta, carpeta, fichero de datos y ficheros de clave, en un fichero
   `.kpmbak` cifrado con la contraseña maestra.
 - Lista de clientes con búsqueda, etiquetas y favoritos, igual que en Windows.
@@ -62,6 +66,8 @@ Consulta en el móvil, **en solo lectura**, la lista de clientes que gestionas c
 - **Enlaces:** solo `https`, `http` y `mailto`, y siempre se enseña la dirección real antes de abrirla.
 - **Huella:** la maestra se cifra con una clave AES del almacén de claves de Android que exige huella de
   seguridad alta en cada uso y que se invalida si se añade una huella nueva. La maestra no pasa por la interfaz.
+- **Versiones nuevas:** la consulta la hace Rust (petición anónima a la API de GitHub, sin datos del usuario)
+  y solo se abren enlaces del propio repositorio; la interfaz no puede conectarse a ningún sitio.
 - **Copia de seguridad:** cifrada con la maestra (Argon2id + XChaCha20-Poly1305). No incluye el token de
   Microsoft: en el móvil nuevo hay que volver a iniciar sesión. Guárdala en un sitio de confianza: con la
   maestra da acceso a tus ficheros de clave.
