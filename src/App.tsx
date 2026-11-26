@@ -570,6 +570,8 @@ export default function App() {
   const closeVault = () => {
     api.closeVault().catch(() => {});
     setBrowsing(null);
+    // El vault recién usado sube en la lista.
+    api.keys().then(applyLib).catch(() => {});
   };
 
   const unlocked = (v: Vault[], rekeyed = false) => {

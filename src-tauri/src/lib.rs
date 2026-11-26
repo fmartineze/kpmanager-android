@@ -42,6 +42,8 @@ struct VaultView {
     keyfile: Option<String>,
     /// Fichero de clave de la biblioteca de este móvil que le corresponde.
     key: KeyState,
+    /// Último uso (segundos Unix): el más reciente entre Windows (`last_opened`) y este móvil.
+    last_used: Option<u64>,
 }
 
 fn file_name(windows_path: &str) -> String {
@@ -60,10 +62,22 @@ fn views(data: &Data) -> Vec<VaultView> {
             file: file_name(&v.path),
             keyfile: v.keyfile.as_deref().map(file_name),
             key: KeyState::default(),
+            last_used: v.last_opened,
         })
         .collect();
-    v.sort_by(|a, b| b.favorite.cmp(&a.favorite).then_with(|| a.client.to_lowercase().cmp(&b.client.to_lowercase())));
+    sort_vaults(&mut v);
     v
+}
+
+/// Orden de la lista: favoritos primero; dentro de cada grupo, el usado más recientemente; los que nunca se
+/// usaron, al final y por nombre.
+fn sort_vaults(v: &mut [VaultView]) {
+    v.sort_by(|a, b| {
+        b.favorite
+            .cmp(&a.favorite)
+            .then_with(|| b.last_used.cmp(&a.last_used))
+            .then_with(|| a.client.to_lowercase().cmp(&b.client.to_lowercase()))
+    });
 }
 
 /// Añade a cada vault la clave de la biblioteca que le toca.
@@ -108,7 +122,13 @@ struct Session {
 
 impl Session {
     fn vaults(&self) -> Vec<VaultView> {
-        with_keys(&views(&self.data), &self.config.library)
+        let mut v = with_keys(&views(&self.data), &self.config.library);
+        // Lo abierto en el móvil cuenta tanto como lo abierto en Windows.
+        for x in &mut v {
+            x.last_used = x.last_used.max(self.config.vault_used.get(&x.id).copied());
+        }
+        sort_vaults(&mut v);
+        v
     }
 
     /// Limpia las copias locales de vaults (caducadas, huérfanas, sueltas) y guarda si cambió algo.
@@ -1107,6 +1127,30 @@ mod tests {
         assert!(matches!(try_master(&paths, "nueva"), Ok(Tried::Open(..))));
         assert!(matches!(try_master(&paths, "vieja"), Err(AppError::WrongPassword)));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_is_sorted_by_favorite_then_last_used() {
+        let plain = br#"{"format":1,"settings":{"keepassxc":null,"default_keyfile":null},"vaults":[
+            {"id":"a","client":"Antiguo","path":"a.kdbx","keyfile":null,"password":"x","last_opened":100},
+            {"id":"b","client":"Nunca B","path":"b.kdbx","keyfile":null,"password":"x"},
+            {"id":"c","client":"Reciente","path":"c.kdbx","keyfile":null,"password":"x","last_opened":300},
+            {"id":"d","client":"Fav viejo","path":"d.kdbx","keyfile":null,"password":"x","favorite":true,"last_opened":50},
+            {"id":"e","client":"Fav nuevo","path":"e.kdbx","keyfile":null,"password":"x","favorite":true,"last_opened":200},
+            {"id":"f","client":"nunca A","path":"f.kdbx","keyfile":null,"password":"x"}]}"#;
+        let order: Vec<String> = views(&Data::parse(plain).unwrap()).into_iter().map(|v| v.client).collect();
+        assert_eq!(order, ["Fav nuevo", "Fav viejo", "Reciente", "Antiguo", "nunca A", "Nunca B"]);
+
+        // Abrir «Antiguo» en el móvil (después de todo lo de Windows) lo sube por delante de «Reciente».
+        let mut v = views(&Data::parse(plain).unwrap());
+        for x in &mut v {
+            if x.id == "a" {
+                x.last_used = x.last_used.max(Some(400));
+            }
+        }
+        sort_vaults(&mut v);
+        let order: Vec<&str> = v.iter().map(|v| v.client.as_str()).collect();
+        assert_eq!(&order[..4], ["Fav nuevo", "Fav viejo", "Antiguo", "Reciente"], "los favoritos siguen delante");
     }
 
     #[test]

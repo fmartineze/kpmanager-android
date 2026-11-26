@@ -41,6 +41,8 @@ export interface Vault {
   /** Nombre del fichero de clave que usa en Windows. */
   keyfile: string | null;
   key: KeyState;
+  /** Último uso (segundos Unix), en Windows o en este móvil. */
+  lastUsed: number | null;
 }
 
 /** Fichero de la biblioteca (el contenido nunca llega a la interfaz). */

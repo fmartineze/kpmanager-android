@@ -1,6 +1,6 @@
 [package]
 name = "kpmanager-android"
-version = "0.4.3"
+version = "0.4.4"
 description = "KP Manager para Android: consulta de solo lectura de los vaults de KeePass"
 authors = ["fmartineze"]
 license = "MIT"
